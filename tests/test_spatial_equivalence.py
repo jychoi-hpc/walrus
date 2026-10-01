@@ -253,3 +253,49 @@ def _attention_refuses_slabs(ctx):
 
 def test_full_attention_refuses_to_run_on_slabs_until_t301():
     assert all(run_on_spatial_group(_attention_refuses_slabs))
+
+
+# t202: halo exchange - a convolution on halo'd slabs equals the full domain
+class HaloConv(nn.Module):
+    """Conv with an odd kernel along x. Full domain: pad x (zeros or periodic)
+    then convolve. Slab: halo exchange along x, then the same convolution."""
+
+    def __init__(self, kernel=3, periodic=False):
+        super().__init__()
+        torch.manual_seed(3)
+        self.width, self.periodic = kernel // 2, periodic
+        self.conv = nn.Conv3d(4, 5, kernel_size=(kernel, 3, 3), padding=(0, 1, 1))
+        self.spatial_ctx = None
+
+    def forward(self, x):
+        from walrus.utils.halo_exchange import halo_exchange
+
+        if self.spatial_ctx is not None:
+            x = halo_exchange(x, 2, self.width, self.spatial_ctx, self.periodic)
+        else:
+            pad = (0, 0, 0, 0, self.width, self.width)
+            x = (torch.nn.functional.pad(x, pad, mode="circular") if self.periodic
+                 else torch.nn.functional.pad(x, pad))
+        return self.conv(x)
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+@pytest.mark.parametrize("kernel, n_points", [(3, 32), (3, 40), (5, 40)])
+def test_halo_exchange_conv_is_equivalent(periodic, kernel, n_points):
+    assert_spatially_equivalent(partial(HaloConv, kernel, periodic), (2, 4, n_points, 6, 6),
+                                split_dim=2, align=4, make_spatial_module=split)
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+def test_halo_exchange_with_two_gpus(periodic):
+    # Left and right neighbor are the same rank
+    assert_spatially_equivalent(partial(HaloConv, 3, periodic), SHAPE, split_dim=2,
+                                align=4, make_spatial_module=split, world_size=2)
+
+
+def test_halo_wider_than_slab_is_rejected():
+    reports = None
+    with pytest.raises(Exception, match="narrower than the halo"):
+        reports = check_spatial_equivalence(partial(HaloConv, 5), (1, 4, 4, 6, 6),
+                                            split_dim=2, make_spatial_module=split)
+    assert reports is None

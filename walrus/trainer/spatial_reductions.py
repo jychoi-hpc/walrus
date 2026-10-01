@@ -42,9 +42,10 @@ def global_std_mean(x: torch.Tensor, dims: Sequence[int], ctx: SpatialContext,
     return (sq_dev / (count - correction)).sqrt(), mean
 
 
-def slab_share(n_local_points: int, ctx: SpatialContext) -> float:
-    """This slab's fraction of the domain's points."""
-    total = torch.tensor(float(n_local_points))
+def slab_share(n_local_points: int, ctx: SpatialContext, device=None) -> float:
+    """This slab's fraction of the domain's points. `device` must suit the
+    group's backend (a CUDA device for NCCL)."""
+    total = torch.tensor(float(n_local_points), device=device)
     dist.all_reduce(total, group=ctx.group)
     return n_local_points / float(total)
 
@@ -57,4 +58,4 @@ def spatial_mean_loss(loss_fn, y_pred: torch.Tensor, y_ref: torch.Tensor, metada
     Not valid for losses that are nonlinear in the spatial mean (RMSE, NRMSE)."""
     n_space = metadata.n_spatial_dims
     n_local = math.prod(y_pred.shape[-n_space - 1 : -1])
-    return loss_fn(y_pred, y_ref, metadata, **kwargs) * slab_share(n_local, ctx)
+    return loss_fn(y_pred, y_ref, metadata, **kwargs) * slab_share(n_local, ctx, y_pred.device)

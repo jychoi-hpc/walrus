@@ -85,17 +85,17 @@ def _compare(name, got, want, atol, rtol, report: Report):
 
 def _check_on_rank(ctx: SpatialContext, make_module, make_spatial_module, input_shape,
                    split_dim, out_split_dim, align, seed, atol, rtol,
-                   output_is_partial_sum=False) -> Report:
+                   output_is_partial_sum=False, device="cpu") -> Report:
     torch.manual_seed(seed)
-    reference = make_module().double()
+    reference = make_module().double().to(device)
     spatial = (make_spatial_module or (lambda m: m))(copy.deepcopy(reference)).double()
     gen = torch.Generator().manual_seed(seed + 1)
-    x_full = torch.randn(input_shape, generator=gen, dtype=torch.float64)
+    x_full = torch.randn(input_shape, generator=gen, dtype=torch.float64).to(device)
 
     # Reference on the full grid
     x = x_full.clone().requires_grad_()
     y = reference(x)
-    upstream = torch.randn(y.shape, generator=gen, dtype=torch.float64)
+    upstream = torch.randn(y.shape, generator=gen, dtype=torch.float64).to(device)
     (y * upstream).sum().backward()
 
     # Spatial version on this rank's slab
