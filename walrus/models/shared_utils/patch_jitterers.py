@@ -1,3 +1,4 @@
+import itertools
 from typing import List, Optional, Sequence, cast
 
 import torch
@@ -7,6 +8,58 @@ from einops import rearrange
 from the_well.data.datasets import BoundaryCondition
 
 from walrus.utils.distributed_gather import roll_split, shared_randint
+
+
+def _rolled_ranges(start: int, stop: int, shift: int, length: int):
+    """Where [start, stop) of an axis of `length` lands after torch.roll by
+    `shift`: one or two (start, stop) ranges."""
+    if start >= stop:
+        return []
+    begin, size = (start + shift) % length, stop - start
+    if begin + size <= length:
+        return [(begin, begin + size)]
+    return [(begin, length), (0, begin + size - length)]
+
+
+def write_flags(flags: torch.Tensor, flag_ops, shifts) -> None:
+    """Boundary flag channels (T, B, 3, *space): BiasCorr = 1 everywhere, then
+    the recorded ("add" 1 | "zero", channel, dim, slice) operations, each
+    region moved to where torch.roll by `shifts` ({dim: shift}) would put it."""
+    flags.zero_()
+    flags[:, :, 0] = 1.0
+    for kind, channel, dim, region in flag_ops:
+        length = flags.shape[dim]
+        start, stop, _ = region.indices(length)
+        for a, b in _rolled_ranges(start, stop, shifts.get(dim, 0), length):
+            index = [slice(None)] * flags.dim()
+            index[2], index[dim] = channel, slice(a, b)
+            if kind == "add":
+                flags[tuple(index)] += 1.0
+            else:
+                flags[tuple(index)] = 0.0
+
+
+def roll_into(dst: torch.Tensor, src: torch.Tensor, shifts) -> None:
+    """dst = torch.roll(src, shifts) ({dim: shift}) by block copies, without a
+    temporary: a roll along one axis moves two blocks."""
+    blocks = [((slice(None), slice(None)),)] * src.dim()
+    for dim, shift in shifts.items():
+        length = src.shape[dim]
+        r = shift % length
+        if r:
+            blocks[dim] = ((slice(r, None), slice(None, length - r)),
+                           (slice(None, r), slice(length - r, None)))
+    for combo in itertools.product(*blocks):
+        dst[tuple(d for d, _ in combo)].copy_(src[tuple(src_s for _, src_s in combo)])
+
+
+def assemble_rolled(x: torch.Tensor, flag_ops, shifts) -> torch.Tensor:
+    """torch.roll(torch.cat((x, flags), dim=2), shifts) built in one buffer."""
+    channels = x.shape[2]
+    out = x.new_empty(x.shape[:2] + (channels + 3,) + x.shape[3:])
+    write_flags(out[:, :, channels:], flag_ops, shifts)
+    roll_into(out[:, :, :channels], x, shifts)
+    return out
 
 
 class PatchJitterer(nn.Module):
@@ -331,12 +384,10 @@ class PatchJittererBoundaryPad(nn.Module):
 
         x = rearrange(x, "(t b) c h w d -> t b c h w d", t=T)
         # Randomly roll each dimension by a random amount < 1 patch
-        base_slices = [slice(None)] * len(x.shape)
         roll_quantities, roll_dims = [], []
-        bc_flag_shape = list(x.shape)
-        bc_flag_shape[2] = 3  # BiasCorr/Open/close
-        bc_flags = torch.zeros(bc_flag_shape, device=x.device, dtype=x.dtype)
-        bc_flags[:, :, 0] = 1.0  # BiasCorr
+        # Boundary flags (BiasCorr/Open/close channels), recorded as operations
+        # and written once the rolls are known
+        flag_ops = []
         # Padding phase
         for i in range(self.max_d):
             # If we're beyond the number of spatial dims, skip
@@ -345,23 +396,15 @@ class PatchJittererBoundaryPad(nn.Module):
 
             # apply the learned BC values along the slices (corners are sum of padding tokens)
             if int(bcs[i][0]) != BoundaryCondition["PERIODIC"].value:
-                # Override base slice to specific dimension
-                beginning, end = base_slices[:], base_slices[:]
-                beginning[i + dim_offset] = slice(
-                    None, constant_paddings[-2 * i - 2]
-                )  #
-                beginning[2] = 1 + int(bcs[i][0])
-                end[i + dim_offset] = slice(-constant_paddings[-2 * i - 1], None)
-                end[2] = 1 + int(bcs[i][1])
+                beginning = slice(None, constant_paddings[-2 * i - 2])
+                end = slice(-constant_paddings[-2 * i - 1], None)
                 # Use to apply constant padding
-                bc_flags[tuple(beginning)] = bc_flags[tuple(beginning)] + 1.0
-                bc_flags[tuple(end)] = bc_flags[tuple(end)] + 1.0
+                flag_ops.append(("add", 1 + int(bcs[i][0]), i + dim_offset, beginning))
+                flag_ops.append(("add", 1 + int(bcs[i][1]), i + dim_offset, end))
                 # Hack eproduce the bias term behavioral of previous implementation where projection bias is only applied to non-boundaries
                 # Only necessary for experiment consistency - not for actual use.
-                beginning[2] = 0
-                end[2] = 0
-                bc_flags[tuple(beginning)] = 0.0
-                bc_flags[tuple(end)] = 0.0
+                flag_ops.append(("zero", 0, i + dim_offset, beginning))
+                flag_ops.append(("zero", 0, i + dim_offset, end))
             if self.jitter_patches:
                 if _patch_size[i] <= 1:
                     roll_quantities.append(0)
@@ -372,13 +415,20 @@ class PatchJittererBoundaryPad(nn.Module):
                     # TODO - move this to using random state to avoid compilation issues
                     roll_quantities.append(roll_rate)
                 roll_dims.append(i + dim_offset)
-        x = torch.cat((x, bc_flags), dim=2)
-        # Now roll by the randomly sampled values if jitter_patches is true
-        if self.jitter_patches:
-            # Now roll by the randomly sampled values if jitter_patches is true
-            if jitter_override is not None:
-                roll_quantities = jitter_override["rolls"][0]
-            x = self._roll(x, roll_quantities, roll_dims, dim_offset)
+        if self.jitter_patches and jitter_override is not None:
+            roll_quantities = jitter_override["rolls"][0]
+        shifts = dict(zip(roll_dims, roll_quantities)) if self.jitter_patches else {}
+        if self._split() is None:
+            # Data and flags written straight into their rolled positions: same
+            # values as concatenating and rolling, without those two copies
+            x = assemble_rolled(x, flag_ops, shifts)
+        else:
+            bc_flags = x.new_empty(x.shape[:2] + (3,) + x.shape[3:])
+            write_flags(bc_flags, flag_ops, {})
+            x = torch.cat((x, bc_flags), dim=2)
+            del bc_flags
+            if self.jitter_patches:
+                x = self._roll(x, roll_quantities, roll_dims, dim_offset)
         # Use kwargs for optional compatibility with different versions
         jitter_info = {
             "constant_paddings": constant_paddings,

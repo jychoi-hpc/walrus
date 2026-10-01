@@ -27,6 +27,45 @@ from walrus.models.shared_utils.patch_jitterers import (
 )
 
 
+class _FieldDropoutScale(torch.autograd.Function):
+    """(x * noise) * dummy, keeping only x (alive anyway) for backward instead
+    of the dropped-out copy: same operations in the same order as dropout
+    followed by the scale, so the same values and gradients."""
+
+    @staticmethod
+    def forward(ctx, x, noise, dummy):
+        ctx.has_noise = noise is not None
+        ctx.save_for_backward(x, noise if noise is not None else x.new_empty(0), dummy)
+        dropped = x * noise if noise is not None else x
+        return dropped * dummy
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, noise, dummy = ctx.saved_tensors
+        grad_x = grad_dummy = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad * dummy
+            if ctx.has_noise:
+                grad_x = grad_x * noise
+        if ctx.needs_input_grad[2]:
+            dropped = x * noise if ctx.has_noise else x
+            grad_dummy = (grad * dropped).sum_to_size(dummy.shape)
+        return grad_x, None, grad_dummy
+
+
+def field_dropout_and_scale(x, dummy, p: float, training: bool):
+    """Same as dropout3d over whole fields of x (T B C ...), then x * dummy,
+    without input-sized intermediate copies. The noise is drawn exactly as
+    F.dropout3d draws it (one value per batch entry and channel), so the same
+    random numbers are used."""
+    noise = None
+    if training and p > 0:
+        T, B, C = x.shape[:3]
+        ones = x.new_ones(B, C, 1, 1, 1)
+        noise = F.dropout3d(ones, p=p, training=True).view(1, B, C, *([1] * (x.dim() - 3)))
+    return _FieldDropoutScale.apply(x, noise, dummy)
+
+
 def dim_pad(x, max_d):
     """
     Assume T B C are first channels, then see how many spatial dims we need to append/
@@ -203,17 +242,14 @@ class IsotropicModel(nn.Module):
         else:
             dim_key = str(self.dim_key_override)
         T, B = x.shape[:2]
-        # Project into higher dim
-        x = rearrange(
-            x, "t b c h ... -> b c (t h) ..."
-        )  # Field dropout is intended to drop out the entire field. We could either implement our own mask or reshape to use existing function and this was slightly faster
-        x = F.dropout3d(
-            x, training=self.training, p=self.input_field_drop / x.shape[1]
-        )  # Bonferonni correction for variable fields - all
-        x = rearrange(x, "b c (t h) ... -> t b c h ...", t=T)
-        x = (
-            x * encoder_dummy
-        )  # NOTE - this is just a single scalar to work around a bug in PyTorch's grad checkpointing - if this moves away from zero, we can add it to the space bag weights in postprocessing
+        # Field dropout drops entire fields (one draw per batch entry and
+        # channel); Bonferroni correction for variable fields.
+        # encoder_dummy is a single scalar to work around a bug in PyTorch's
+        # grad checkpointing - if this moves away from zero, we can add it to
+        # the space bag weights in postprocessing.
+        x = field_dropout_and_scale(
+            x, encoder_dummy, p=self.input_field_drop / x.shape[2], training=self.training
+        )
         # x = self.space_bag(x, state_labels)
         # x = rearrange(x, "t b ... c -> t b c ...")
         # Now encoder

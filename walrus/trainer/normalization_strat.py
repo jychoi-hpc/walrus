@@ -84,6 +84,19 @@ class BaseRevNormalization:
                 :, :, :n_channels
             ]
 
+    def normalize_stdmean_(self, x: torch.Tensor, stats: NormalizationStats) -> torch.Tensor:
+        """In-place normalize_stdmean, for when the raw input is not needed
+        again (training): same operations, so the same values, without a
+        second input-sized tensor. Falls back to the out-of-place version when
+        the result dtype would differ from x's."""
+        n_channels = x.shape[2]
+        mean = stats.sample_mean[:, :, :n_channels]
+        std = stats.sample_std[:, :, :n_channels]
+        if torch.result_type(x, mean) != x.dtype or torch.result_type(x, std) != x.dtype:
+            return self.normalize_stdmean(x, stats)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return x.sub_(mean).div_(std)
+
     def normalize_delta(
         self,
         x: torch.Tensor,

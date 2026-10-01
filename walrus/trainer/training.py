@@ -461,6 +461,10 @@ class Trainer:
         if rollout_steps > train_rollout_limit and train:
             raise ValueError("Multiple step prediction in train mode not yet supported")
         y_ref = y_ref[:, :rollout_steps]
+        if train:
+            # The target is built; nothing reads the device copy of the raw
+            # output fields again (at full resolution it is as large as the input)
+            batch["output_fields"] = None
         # Create a moving batch of one step at a time
         # A shallow copy is enough: the loop below only rebinds
         # moving_batch["input_fields"] and never modifies tensors in place.
@@ -481,9 +485,12 @@ class Trainer:
                 )
             # NOTE - Currently assuming only [0] (fields) needs normalization
             normalized_inputs = inputs[:]  # Map type bugs out
-            normalized_inputs[0] = self.revin.normalize_stdmean(
-                normalized_inputs[0], normalization_stats
+            # In training the raw input is not read again: normalize in place
+            # (same values, one input-sized tensor less)
+            normalize = (
+                self.revin.normalize_stdmean_ if train else self.revin.normalize_stdmean
             )
+            normalized_inputs[0] = normalize(normalized_inputs[0], normalization_stats)
             if train:
                 ensemble_size = 1  # No ensembling during training right now
             else:
