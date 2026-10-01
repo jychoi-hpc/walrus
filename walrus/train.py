@@ -11,6 +11,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from torchinfo import summary
 
 from walrus.data import MixedWellDataModule
+from walrus.data.slabs import assign_slabs
 from walrus.data.well_to_multi_transformer import (
     ChannelsFirstWithTimeFormatter,
 )
@@ -28,7 +29,7 @@ from walrus.utils.experiment_utils import (
     align_checkpoint_with_field_to_index_map,
     configure_experiment,
 )
-from walrus.utils.spatial import get_spatial_context
+from walrus.utils.spatial import enable_domain_split, get_spatial_context
 
 logger = logging.getLogger("walrus")
 # logger.setLevel(level=logging.DEBUG)
@@ -95,6 +96,9 @@ def train(
         field_index_map_override=cfg.data.get("field_index_map_override", {}),
         transform=cfg.data.get("transform", None),
     )
+    split_domain = spatial is not None and cfg.distribution.get("split_domain", False)
+    if split_domain:
+        assign_slabs(datamodule, spatial)  # each GPU reads only its slab
     field_to_index_map = datamodule.train_dataset.field_to_index_map
     # Retrieve the number of fields used in training
     # from the mapping of field to index and incrementing by 1
@@ -165,6 +169,8 @@ def train(
         device = torch.device("cpu")
 
     model = model.to(device)
+    if split_domain:
+        enable_domain_split(model, spatial)
     model = distribute_model(model, cfg, device_mesh)
 
     logger.info(f"Instantiate optimizer {cfg.optimizer._target_}")
@@ -304,6 +310,8 @@ def train(
         start_epoch=start_epoch,
         start_val_loss=val_loss,
     )
+    if split_domain:
+        trainer.enable_domain_split(spatial)
     # Validation mode only runs validation loop on valid and test data. No training.
     if cfg.validation_mode:
         # If we're validating to a different directory, still copy the config here so we know where it came from

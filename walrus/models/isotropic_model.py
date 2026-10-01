@@ -53,16 +53,21 @@ class _FieldDropoutScale(torch.autograd.Function):
         return grad_x, None, grad_dummy
 
 
-def field_dropout_and_scale(x, dummy, p: float, training: bool):
+def field_dropout_and_scale(x, dummy, p: float, training: bool, spatial_ctx=None):
     """Same as dropout3d over whole fields of x (T B C ...), then x * dummy,
     without input-sized intermediate copies. The noise is drawn exactly as
     F.dropout3d draws it (one value per batch entry and channel), so the same
-    random numbers are used."""
+    random numbers are used. On a split domain (spatial_ctx) it is drawn on
+    the group's first rank and broadcast, so all slabs drop the same fields."""
     noise = None
     if training and p > 0:
         T, B, C = x.shape[:3]
         ones = x.new_ones(B, C, 1, 1, 1)
-        noise = F.dropout3d(ones, p=p, training=True).view(1, B, C, *([1] * (x.dim() - 3)))
+        noise = F.dropout3d(ones, p=p, training=True)
+        if spatial_ctx is not None and spatial_ctx.size > 1:
+            src = torch.distributed.get_global_rank(spatial_ctx.group, 0)
+            torch.distributed.broadcast(noise, src=src, group=spatial_ctx.group)
+        noise = noise.view(1, B, C, *([1] * (x.dim() - 3)))
     return _FieldDropoutScale.apply(x, noise, dummy)
 
 
@@ -248,7 +253,11 @@ class IsotropicModel(nn.Module):
         # grad checkpointing - if this moves away from zero, we can add it to
         # the space bag weights in postprocessing.
         x = field_dropout_and_scale(
-            x, encoder_dummy, p=self.input_field_drop / x.shape[2], training=self.training
+            x,
+            encoder_dummy,
+            p=self.input_field_drop / x.shape[2],
+            training=self.training,
+            spatial_ctx=self.spatial_ctx,
         )
         # x = self.space_bag(x, state_labels)
         # x = rearrange(x, "t b ... c -> t b c ...")
@@ -355,7 +364,14 @@ class IsotropicModel(nn.Module):
             and self.embed[dim_key].variable_deterministic_ds
         ):
             # support for variable but deterministic downsampling
-            dynamic_ks = choose_kernel_size_deterministic(x_shape)
+            # On a split domain the patch size follows the full grid, not the slab
+            kernel_shape = list(x_shape)
+            if self.spatial_ctx is not None and self.spatial_ctx.size > 1:
+                axis = self.spatial_ctx.axis
+                kernel_shape[axis] = slab_start_and_total(
+                    x_shape[axis], self.spatial_ctx, x.device
+                )[1]
+            dynamic_ks = choose_kernel_size_deterministic(tuple(kernel_shape))
             patch_size = [reduce(mul, k) for k in dynamic_ks]
             # patch_size doesn't matter for the dimension that is higher than the number of spatial dims
             patch_size.extend([0] * (self.max_d - len(patch_size)))

@@ -32,6 +32,7 @@ from walrus.trainer.normalization_strat import (
     BaseRevNormalization,
     normalize_target,
 )
+from walrus.trainer.spatial_reductions import spatial_mean_loss
 from walrus.utils.spatial import get_spatial_context
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,8 @@ class Trainer:
         self.reuse_batches = reuse_batches
         # Get derived rank info about which nodes must be synced from the device mesh
         self.spatial = get_spatial_context()
+        # True once enable_domain_split is called: each GPU holds one slab
+        self.split_domain = False
         if self.spatial is not None:
             # A spatial group shares each sample, like an FSDP group shares a dataset
             self.sync_group = self.spatial.group
@@ -394,6 +397,14 @@ class Trainer:
         # but we might want to differentiate them in the future.
         for dset_name, metadata in self.dset_metadata.items():
             self.formatter_dict[metadata.dataset_name] = formatter()
+
+    def enable_domain_split(self, ctx) -> None:
+        """Train on slabs of a domain split across the spatial group ctx: RevIN
+        statistics over the whole domain, and each GPU's loss is its slab's
+        share of the full-domain loss."""
+        self.split_domain = True
+        self.split_ctx = ctx
+        self.revin.spatial_ctx = ctx
 
     def save_model_if_necessary(
         self, epoch: int, validation_loss: float, last: bool = False
@@ -1110,13 +1121,19 @@ class Trainer:
                     assert y_ref.shape == y_pred.shape, (
                         f"Mismatching shapes between reference {y_ref.shape} and prediction {y_pred.shape}"
                     )
-                    loss = (
-                        self.loss_multiplier
-                        * self.loss_fn(
+                    if self.split_domain:
+                        # This slab's share of the full-domain loss, times the
+                        # group size: the gradient average over all GPUs is then
+                        # the sum over each group, averaged over the groups
+                        sample_loss = spatial_mean_loss(
+                            self.loss_fn, y_pred, y_ref, current_metadata,
+                            self.split_ctx, eps=self.model_epsilon,
+                        ).mean() * self.split_ctx.size
+                    else:
+                        sample_loss = self.loss_fn(
                             y_pred, y_ref, current_metadata, eps=self.model_epsilon
                         ).mean()
-                        / grad_acc_steps
-                    )
+                    loss = self.loss_multiplier * sample_loss / grad_acc_steps
                     del y_pred, y_ref  # Let gc free up a little before the BW pass
                 # If not AMP, then grad scaler is no op
                 self.grad_scaler.scale(loss).backward()
@@ -1156,7 +1173,11 @@ class Trainer:
             total_time = time.time() - batch_start
             optimizer_time = total_time - forward_time - backward_time - data_time
             # Syncing for all reduce anyway so may as well compute synchornous metrics
-            epoch_loss += (grad_acc_steps * loss.detach()) / len(
+            logged_loss = loss.detach()
+            if self.split_domain:  # full-domain loss: sum of the slab shares
+                logged_loss = logged_loss / self.split_ctx.size
+                dist.all_reduce(logged_loss, group=self.split_ctx.group)
+            epoch_loss += (grad_acc_steps * logged_loss) / len(
                 dataloader
             )  # Unscale loss for accurate measure.
 
@@ -1165,7 +1186,7 @@ class Trainer:
                 timing = (time.time() - interval_start) / self.log_interval
                 interval_start = time.time()
                 logger.info(
-                    f"Epoch {epoch:>4}, Batch {i + 1}/{len(dataloader)}, Rank {self.rank:>3}, SyncStep: {update_grad}:\n\t Data: {current_metadata.dataset_name:<32}, loss {(grad_acc_steps * loss.item()) ** 0.5:7.4f}, mem {max_mem_GB:5.2f} GB, total_time {timing:5.3f}s, data {data_time:5.4f}s, fwd {forward_time:5.3f}s, bw {backward_time:5.3f}s, opt {optimizer_time:5.3f}s"
+                    f"Epoch {epoch:>4}, Batch {i + 1}/{len(dataloader)}, Rank {self.rank:>3}, SyncStep: {update_grad}:\n\t Data: {current_metadata.dataset_name:<32}, loss {(grad_acc_steps * logged_loss.item()) ** 0.5:7.4f}, mem {max_mem_GB:5.2f} GB, total_time {timing:5.3f}s, data {data_time:5.4f}s, fwd {forward_time:5.3f}s, bw {backward_time:5.3f}s, opt {optimizer_time:5.3f}s"
                 )
             # Log times and memory stats to wandb - I don't trust wandb numbers
             if torch.cuda.is_available():
@@ -1222,6 +1243,12 @@ class Trainer:
         """
         is_test = valid_or_test == "test"  # Check if test
         val_loss, rollout_val_loss = None, None
+        if self.split_domain:
+            logger.warning(
+                f"Epoch {epoch}/{self.max_epoch}: {valid_or_test} validation skipped: "
+                "metrics on a split domain are not implemented yet (tracker task t303b)"
+            )
+            return val_loss, rollout_val_loss
         # First do one step checks = frequency, last epoch, or test. Only do full validation on last epoch or test
         if epoch % self.val_frequency == 0 or epoch >= self.max_epoch or is_test:
             logger.info(

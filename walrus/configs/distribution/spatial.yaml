@@ -2,3 +2,6 @@ distribution_type: spatial
 local_size:
 spatial_size: # GPUs per spatial group; defaults to the GPUs per node (LOCAL_WORLD_SIZE)
 spatial_axis: 0 # Axis split across the group (0 = x)
+# true: each GPU holds one slab of every sample (the domain is split);
+# false: every GPU of a group holds the whole sample (replicated)
+split_domain: false

@@ -540,3 +540,61 @@ class TimeAttention(nn.Module):
 def test_time_attention_is_equivalent_on_slabs():
     assert_spatially_equivalent(TimeAttention, (3, 2, 16, 12, 4, 4), split_dim=3,
                                 make_spatial_module=split)
+
+
+# t303: the whole IsotropicModel on slabs
+class WalrusModel(nn.Module):
+    """A small Walrus model (full spatial attention, 4 heads) in training mode:
+    drop path and field dropout active. The generator is reseeded per forward
+    so the full grid and rank 0 draw the same numbers. Input: T B C x y z;
+    x periodic (split), y wall, z periodic."""
+
+    def __init__(self, jitter=False):
+        from hydra import compose, initialize_config_dir
+        from hydra.utils import instantiate
+
+        from walrus.train import CONFIG_DIR, CONFIG_NAME
+
+        super().__init__()
+        overrides = ["server=local", "model=isotropic_model",
+                     "model/processor/space_mixing=full_spatial_attention",
+                     "model.hidden_dim=64", "model.projection_dim=16",
+                     "model.intermediate_dim=32", "model.processor_blocks=2",
+                     "model.groups=4", "model.processor.space_mixing.num_heads=4",
+                     "model.processor.time_mixing.num_heads=4",
+                     f"model.jitter_patches={jitter}"]
+        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+            cfg = compose(config_name=CONFIG_NAME, overrides=overrides)
+        torch.manual_seed(12)
+        self.model = instantiate(cfg.model, n_states=4)
+
+    def forward(self, x):
+        from unittest import mock
+
+        from the_well.data.datasets import WellMetadata
+
+        shape = (512, 16, 64)  # full grid, also on slabs
+        meta = WellMetadata(dataset_name="dummy", n_spatial_dims=3, grid_type="cartesian",
+                            spatial_resolution=shape, scalar_names=[], constant_scalar_names=[],
+                            constant_field_names={0: [], 1: [], 2: []},
+                            field_names={0: ["a", "b", "c", "d"], 1: [], 2: []},
+                            boundary_condition_types=["PERIODIC", "WALL", "PERIODIC"],
+                            n_files=1, n_trajectories_per_file=[1], n_steps_per_trajectory=[2])
+        bcs = [[[2, 2], [0, 0], [2, 2]]]
+        torch.manual_seed(13)
+        # The full grid draws token rolls with numpy, the split model with torch
+        # on rank 0: route numpy's draw through torch so both see the same numbers
+        torch_randint = lambda low, high=None: int(torch.randint(low, high, (1,)))  # noqa: E731
+        with mock.patch("numpy.random.randint", torch_randint):
+            return self.model(x, torch.arange(4), bcs, metadata=meta)
+
+
+# T B C x y z. x needs patch 32 (strides (8, 4) = Walrus's base kernels, so no
+# padding along the split axis): 512 points, slabs of 128
+MODEL_SHAPE = (2, 1, 4, 512, 16, 64)
+
+
+@pytest.mark.parametrize("jitter", [False, True])
+def test_walrus_model_is_equivalent_on_slabs(jitter):
+    assert_spatially_equivalent(partial(WalrusModel, jitter), MODEL_SHAPE, split_dim=3,
+                                align=32, make_spatial_module=split, atol=1e-9, rtol=1e-7)
