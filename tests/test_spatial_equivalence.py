@@ -299,3 +299,132 @@ def test_halo_wider_than_slab_is_rejected():
         reports = check_spatial_equivalence(partial(HaloConv, 5), (1, 4, 4, 6, 6),
                                             split_dim=2, make_spatial_module=split)
     assert reports is None
+
+
+# t203: distributed gather / roll and shared randomness
+class Roll(nn.Module):
+    """torch.roll along x (dim 2), then a pointwise layer so parameters get gradients."""
+
+    def __init__(self, shift):
+        super().__init__()
+        torch.manual_seed(4)
+        self.shift = shift
+        self.mix = nn.Conv3d(4, 3, kernel_size=1)
+        self.spatial_ctx = None
+
+    def forward(self, x):
+        from walrus.utils.distributed_gather import distributed_roll
+
+        if self.spatial_ctx is not None:
+            x = distributed_roll(x, self.shift, 2, self.spatial_ctx)
+        else:
+            x = torch.roll(x, self.shift, dims=2)
+        return self.mix(x)
+
+
+@pytest.mark.parametrize("shift", [3, -5, 13, 40, -63, 101])
+def test_distributed_roll_is_equivalent(shift):
+    # 40 points in slabs of 12/12/8/8; shifts cross one or several slabs and wrap
+    assert_spatially_equivalent(partial(Roll, shift), (2, 4, 40, 3, 3), split_dim=2,
+                                align=4, make_spatial_module=split)
+
+
+class GatherEveryOtherReversed(nn.Module):
+    """Takes points 2k in reverse order, with zeros in between (index -1)."""
+
+    def __init__(self):
+        super().__init__()
+        self.spatial_ctx = None
+
+    def forward(self, x):
+        from walrus.utils.distributed_gather import gather_global, slab_start_and_total
+
+        n = x.shape[2]
+        if self.spatial_ctx is None:
+            start, total = 0, n
+        else:
+            start, total = slab_start_and_total(n, self.spatial_ctx, x.device)
+        g = torch.arange(start, start + n)
+        index = torch.where(g % 2 == 0, total - 2 - g, torch.full_like(g, -1))
+        if self.spatial_ctx is None:
+            out = torch.zeros_like(x)
+            keep = index >= 0
+            out[:, :, keep] = x[:, :, index[keep]]
+            return out
+        return gather_global(x, 2, index, self.spatial_ctx)
+
+
+def test_gather_global_with_fill_is_equivalent():
+    assert_spatially_equivalent(GatherEveryOtherReversed, (2, 3, 40, 2, 2), split_dim=2,
+                                align=4, make_spatial_module=split)
+
+
+def _shared_draws(ctx):
+    from walrus.utils.distributed_gather import shared_randint
+
+    torch.manual_seed(100 + ctx.rank)  # every rank's generator differs
+    return [shared_randint(-15, 16, ctx) for _ in range(5)]
+
+
+def test_shared_randint_is_the_same_on_every_rank():
+    draws = run_on_spatial_group(_shared_draws)
+    assert all(d == draws[0] for d in draws)
+    torch.manual_seed(100)  # rank 0's generator decides
+    assert draws[0] == [int(torch.randint(-15, 16, (1,))) for _ in range(5)]
+
+
+class JitterEncodeDecode(nn.Module):
+    """The model's path around the patch jitter: jitter (pad + bc flags +
+    roll), patch-embedding conv (kernel = stride = 4), transposed conv back,
+    unjitter. x periodic (split), y wall, z periodic. Input: T B C x y z."""
+
+    def __init__(self, rolls=None):
+        from walrus.models.shared_utils.patch_jitterers import PatchJittererBoundaryPad
+
+        super().__init__()
+        torch.manual_seed(5)
+        self.rolls = rolls
+        self.jitterer = PatchJittererBoundaryPad(stage_dim=4, max_d=3)
+        self.encode = nn.Conv3d(4 + 3, 6, kernel_size=4, stride=4)  # + 3 bc flag channels
+        self.decode = nn.ConvTranspose3d(6, 4, kernel_size=4, stride=4)
+
+    def forward(self, x):
+        from types import SimpleNamespace
+
+        from the_well.data.datasets import BoundaryCondition as BC
+
+        bcs = torch.tensor([[BC.PERIODIC.value] * 2, [BC.WALL.value] * 2,
+                            [BC.PERIODIC.value] * 2])
+        kernels = ((2, 2), (2, 2), (2, 2))  # effective kernel 4 = stride 4
+        override = None
+        if self.rolls is None:
+            torch.manual_seed(7)  # same draws for the full grid and rank 0
+        else:
+            override = {"rolls": (self.rolls, None)}
+        x, info = self.jitterer(x, bcs, SimpleNamespace(n_spatial_dims=3),
+                                patch_size=[4, 4, 4], base_kernel=kernels,
+                                random_kernel=kernels, jitter_override=override)
+        T = x.shape[0]
+        y = self.decode(self.encode(x.flatten(0, 1)))
+        return self.jitterer.unjitter(y.unflatten(0, (T, -1)), info)
+
+
+JITTER_SHAPE = (1, 2, 4, 40, 8, 8)  # T B C x y z; x slabs 12/12/8/8
+
+
+@pytest.mark.parametrize("rolls", [[3, 1, -2], [-9, -1, 1], [17, 0, 3]])
+def test_jitter_with_fixed_rolls_is_equivalent(rolls):
+    assert_spatially_equivalent(partial(JitterEncodeDecode, rolls), JITTER_SHAPE,
+                                split_dim=3, align=4, make_spatial_module=split)
+
+
+def test_jitter_with_random_rolls_is_equivalent():
+    # The split run uses rank 0's draws, broadcast to the group
+    assert_spatially_equivalent(JitterEncodeDecode, JITTER_SHAPE, split_dim=3, align=4,
+                                make_spatial_module=split)
+
+
+def test_jitter_differs_without_split():
+    reports = check_spatial_equivalence(partial(JitterEncodeDecode, [3, 1, -2]), JITTER_SHAPE,
+                                        split_dim=3, align=4)
+    assert not all(r["output"][2] for r in reports)

@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from the_well.data.datasets import BoundaryCondition
 
+from walrus.utils.distributed_gather import roll_split, shared_randint
+
 
 class PatchJitterer(nn.Module):
     """Applies random shifts to patches so that error doesn't accumulate in single patches
@@ -206,6 +208,35 @@ class PatchJittererBoundaryPad(nn.Module):
         self.jitter_patches = jitter_patches
         self.patch_size = patch_size
         self.max_d = max_d
+        # Set by walrus.utils.spatial.enable_domain_split: the input is one slab
+        self.spatial_ctx = None
+
+    def _split(self):
+        ctx = getattr(self, "spatial_ctx", None)
+        return ctx if ctx is not None and ctx.size > 1 else None
+
+    def _check_split(self, bcs, constant_paddings, periodic_paddings):
+        """Supported when the split axis is periodic and needs no padding
+        (encoder kernel = stride along it, e.g. patch 32 from (8, 4) kernels)."""
+        ctx = self._split()
+        if ctx is None:
+            return
+        i = ctx.axis
+        if int(bcs[i][0]) != BoundaryCondition["PERIODIC"].value:
+            raise NotImplementedError("patch jitter on a split wall axis")
+        if periodic_paddings[-2 * i - 2] or periodic_paddings[-2 * i - 1]:
+            raise NotImplementedError("patch jitter with padding along the split axis")
+
+    def _draw_roll(self, low, high):
+        ctx = self._split()
+        if ctx is not None:  # every slab of a sample must roll by the same amount
+            return shared_randint(low, high, ctx)
+        return int(torch.randint(low, high, ()))
+
+    def _roll(self, x, shifts, dims, dim_offset):
+        ctx = self._split()
+        split_dim = ctx.axis + dim_offset if ctx is not None else None
+        return roll_split(x, shifts, dims, ctx, split_dim)
 
     def get_paddings(self, shape: Sequence[int], bcs, n_dims, _patch_size, kwargs):
         """Compute amount of padding needed on each dimension from the patch size, BC type, and shape"""
@@ -291,6 +322,7 @@ class PatchJittererBoundaryPad(nn.Module):
         constant_paddings, periodic_paddings, effective_ps, effective_stride = (
             self.get_paddings(shape, bcs, n_dims, _patch_size, kwargs)
         )
+        self._check_split(bcs, constant_paddings, periodic_paddings)
 
         if sum(constant_paddings) > 0:
             x = F.pad(x, pad=constant_paddings, mode="constant")
@@ -336,7 +368,7 @@ class PatchJittererBoundaryPad(nn.Module):
                 else:
                     half_patch = _patch_size[i] // 2
                     # Compute and log the random roll for this dimension
-                    roll_rate = int(torch.randint(-(half_patch - 1), half_patch, ()))
+                    roll_rate = self._draw_roll(-(half_patch - 1), half_patch)
                     # TODO - move this to using random state to avoid compilation issues
                     roll_quantities.append(roll_rate)
                 roll_dims.append(i + dim_offset)
@@ -346,7 +378,7 @@ class PatchJittererBoundaryPad(nn.Module):
             # Now roll by the randomly sampled values if jitter_patches is true
             if jitter_override is not None:
                 roll_quantities = jitter_override["rolls"][0]
-            x = torch.roll(x, shifts=roll_quantities, dims=roll_dims)
+            x = self._roll(x, roll_quantities, roll_dims, dim_offset)
         # Use kwargs for optional compatibility with different versions
         jitter_info = {
             "constant_paddings": constant_paddings,
@@ -368,7 +400,7 @@ class PatchJittererBoundaryPad(nn.Module):
             roll_quantities, roll_dims = rolls
             roll_quantities = [-r for r in roll_quantities]
             # Reverse by rolling/padding with negative values
-            x = torch.roll(x, shifts=roll_quantities, dims=roll_dims)
+            x = self._roll(x, roll_quantities, roll_dims, dim_offset=3)
         paddings = [-(p1 + p2) for p1, p2 in zip(constant_paddings, periodic_paddings)]
         x = F.pad(x, pad=paddings)
         return x
@@ -384,6 +416,8 @@ class FixedPatchJittererBoundaryPad(PatchJittererBoundaryPad):
         jitter_override=None,  # Used for testing
         **kwargs,
     ):
+        if self._split() is not None:
+            raise NotImplementedError("FixedPatchJittererBoundaryPad on a split domain")
         # x: (T, B, C, H, W, D) - so need to apply to 3D padded data
         # bcs: (n_dims, 2)
         # Allow for identity mapping to simplify code

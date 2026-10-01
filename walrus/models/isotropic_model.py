@@ -16,6 +16,11 @@ from walrus.models.shared_utils.flexi_utils import (
     choose_kernel_size_random,
 )
 from walrus.models.shared_utils.normalization import RMSGroupNorm
+from walrus.utils.distributed_gather import (
+    roll_split,
+    shared_randint,
+    slab_start_and_total,
+)
 from walrus.models.shared_utils.patch_jitterers import (
     FixedPatchJittererBoundaryPad,
     PatchJittererBoundaryPad,
@@ -81,6 +86,8 @@ class IsotropicModel(nn.Module):
         self.dp = np.linspace(0, drop_path, processor_blocks)
         self.causal_in_time = causal_in_time
         self.gradient_checkpointing_freq = gradient_checkpointing_freq
+        # Set by walrus.utils.spatial.enable_domain_split: inputs are slabs
+        self.spatial_ctx = None
         self.override_dimensionality = override_dimensionality
         self.dim_key_override = dim_key_override
         self.encoder_dummy = nn.Parameter(
@@ -366,32 +373,37 @@ class IsotropicModel(nn.Module):
         for dim in range(len(bcs[0])):
             if bcs[0][dim][0] == BoundaryCondition["PERIODIC"].value:
                 periodic_dims.append(dim + 3)
-        periodic_dim_shapes = [x.shape[dim] for dim in periodic_dims]
+        # On a split domain the split axis is rolled across the spatial group,
+        # by amounts drawn once for the whole group
+        split = self.spatial_ctx if self.spatial_ctx and self.spatial_ctx.size > 1 else None
+        split_dim = 3 + split.axis if split else None
+        periodic_dim_shapes = [
+            slab_start_and_total(x.shape[dim], split, x.device)[1]
+            if dim == split_dim
+            else x.shape[dim]
+            for dim in periodic_dims
+        ]
+        draw = (
+            (lambda n: shared_randint(0, n, split, x.device))
+            if split
+            else (lambda n: np.random.randint(0, n))
+        )
         roll_total = [0] * len(periodic_dims)
         for ii, blk in enumerate(self.blocks):
             # Randomly roll dimensions of x corresponding to periodic BCs
             if len(periodic_dims) > 0 and self.jitter_patches:
                 roll_quantities = [
-                    np.random.randint(0, periodic_dim_shapes[dim])
-                    for dim in range(len(periodic_dims))
+                    draw(periodic_dim_shapes[dim]) for dim in range(len(periodic_dims))
                 ]
                 roll_total = [
                     roll_quantities[dim] + r for dim, r in enumerate(roll_total)
                 ]
-                x = torch.roll(
-                    x,
-                    shifts=roll_quantities,
-                    dims=periodic_dims,
-                )
+                x = roll_split(x, roll_quantities, periodic_dims, split, split_dim)
             x, att_maps = blk(x, bcs, return_att=return_att)
             all_att_maps += att_maps
         # If we randomly rolled, we need to roll back
         if sum(roll_total) > 0 and self.jitter_patches:
-            x = torch.roll(
-                x,
-                shifts=[-r for r in roll_total],
-                dims=periodic_dims,
-            )
+            x = roll_split(x, [-r for r in roll_total], periodic_dims, split, split_dim)
         # Decode
         # If not causal, no need to debed all time steps so just take the last one
         if not self.causal_in_time:
