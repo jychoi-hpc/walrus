@@ -22,6 +22,7 @@ from walrus.trainer.training import Trainer
 from walrus.utils.distribution_utils import (
     configure_distribution,
     distribute_model,
+    setup_env_from_slurm,
 )
 from walrus.utils.experiment_utils import (
     align_checkpoint_with_field_to_index_map,
@@ -331,7 +332,8 @@ def main(cfg: DictConfig):
     # Torch optimization settings
     torch.set_float32_matmul_precision("high")  # Use TF32 when supported
     torch.backends.cudnn.allow_tf32 = True
-    # Retrieve multiple processes context to setup DDP
+    # Retrieve multiple processes context to setup DDP (from torchrun or srun)
+    setup_env_from_slurm()
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

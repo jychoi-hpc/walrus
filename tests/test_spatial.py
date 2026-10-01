@@ -1,5 +1,6 @@
 import os
 import socket
+from unittest import mock
 
 import pytest
 import torch
@@ -7,6 +8,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 
+from walrus.utils.distribution_utils import _first_host, setup_env_from_slurm
 from walrus.utils.spatial import (
     DATA_PARALLEL_DIM,
     SPATIAL_DIM,
@@ -88,6 +90,61 @@ def test_spatial_groups_on_mesh():
         2: (0, 2, 1, 2, [2, 3]),
         3: (1, 2, 1, 2, [2, 3]),
     }
+
+
+TORCH_VARS = ["RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"]
+
+
+@mock.patch.dict(os.environ)
+def test_setup_env_from_slurm(monkeypatch):
+    for var in TORCH_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("SLURM_PROCID", "5")
+    monkeypatch.setenv("SLURM_NTASKS", "8")
+    monkeypatch.setenv("SLURM_LOCALID", "1")
+    monkeypatch.delenv("SLURM_NTASKS_PER_NODE", raising=False)
+    monkeypatch.setenv("SLURM_TASKS_PER_NODE", "4(x2)")
+    monkeypatch.delenv("SLURM_STEP_NODELIST", raising=False)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "nid[001234-001237,001240]")
+    setup_env_from_slurm()
+    assert {v: os.environ[v] for v in TORCH_VARS} == {
+        "RANK": "5",
+        "WORLD_SIZE": "8",
+        "LOCAL_RANK": "1",
+        "LOCAL_WORLD_SIZE": "4",
+        "MASTER_ADDR": "nid001234",
+        "MASTER_PORT": "29500",
+    }
+
+
+@pytest.mark.parametrize(
+    "nodelist, host",
+    [
+        ("nid[001234-001237,001240]", "nid001234"),
+        ("nid001234", "nid001234"),
+        ("nid001240,nid[001234-001235]", "nid001240"),
+        ("", ""),
+    ],
+)
+def test_first_host(nodelist, host):
+    assert _first_host(nodelist) == host
+
+
+@mock.patch.dict(os.environ)
+def test_setup_env_from_slurm_keeps_torchrun_values(monkeypatch):
+    monkeypatch.setenv("SLURM_PROCID", "5")
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("MASTER_ADDR", "node0")
+    setup_env_from_slurm()
+    assert os.environ["RANK"] == "2" and os.environ["MASTER_ADDR"] == "node0"
+
+
+@mock.patch.dict(os.environ)
+def test_setup_env_without_slurm_does_nothing(monkeypatch):
+    for var in TORCH_VARS + ["SLURM_PROCID"]:
+        monkeypatch.delenv(var, raising=False)
+    setup_env_from_slurm()
+    assert not any(v in os.environ for v in TORCH_VARS)
 
 
 def test_no_context_without_spatial_mode():

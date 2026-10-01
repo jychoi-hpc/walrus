@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from functools import partial
 
 import torch
@@ -12,6 +13,42 @@ from torch.distributed.fsdp.wrap import ModuleWrapPolicy, size_based_auto_wrap_p
 from walrus.utils.spatial import DATA_PARALLEL_DIM, SPATIAL_DIM, set_spatial_context
 
 logger = logging.getLogger(__name__)
+
+
+def _first_host(nodelist: str) -> str:
+    """First host of a Slurm node list: 'nid[001234-001237,001240],x' -> 'nid001234'."""
+    m = re.match(r"([^\[,]*)(?:\[([^\]]*)\])?", nodelist)
+    if not m or not m.group(1):
+        return ""
+    prefix, ranges = m.group(1), m.group(2)
+    return prefix + (ranges.split(",")[0].split("-")[0] if ranges else "")
+
+
+def setup_env_from_slurm():
+    """Under `srun` (one task per GPU), fill the torch.distributed variables
+    RANK, WORLD_SIZE, LOCAL_RANK, LOCAL_WORLD_SIZE, MASTER_ADDR and
+    MASTER_PORT from Slurm's. Variables already set (e.g. by torchrun) win."""
+    env = os.environ
+    if "SLURM_PROCID" not in env:
+        return
+    tasks_per_node = env.get("SLURM_NTASKS_PER_NODE") or env.get(
+        "SLURM_TASKS_PER_NODE", "1"
+    ).split("(")[0]
+    defaults = {
+        "RANK": env["SLURM_PROCID"],
+        "WORLD_SIZE": env.get("SLURM_NTASKS", "1"),
+        "LOCAL_RANK": env.get("SLURM_LOCALID", "0"),
+        "LOCAL_WORLD_SIZE": tasks_per_node,
+        # Rank 0 runs on the first node of the step. (Not the launch node: under
+        # salloc that is the login node.)
+        "MASTER_ADDR": _first_host(
+            env.get("SLURM_STEP_NODELIST") or env.get("SLURM_JOB_NODELIST", "")
+        )
+        or "127.0.0.1",
+        "MASTER_PORT": "29500",
+    }
+    for key, value in defaults.items():
+        env.setdefault(key, value)
 
 
 def configure_distribution(cfg):
