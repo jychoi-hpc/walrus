@@ -27,6 +27,7 @@ from walrus.utils.experiment_utils import (
     align_checkpoint_with_field_to_index_map,
     configure_experiment,
 )
+from walrus.utils.spatial import get_spatial_context
 
 logger = logging.getLogger("walrus")
 # logger.setLevel(level=logging.DEBUG)
@@ -81,10 +82,13 @@ def train(
 ):
     """Instantiate the different objects required for training and run the training loop."""
     logger.info(f"Instantiate datamodule {cfg.data.wandb_data_name}")
+    # With spatial parallelism, every GPU of a spatial group reads the same
+    # samples: data is split only across groups.
+    spatial = get_spatial_context()
     datamodule: MixedWellDataModule = instantiate(
         cfg.data.module_parameters,
-        world_size=world_size,
-        rank=rank,
+        world_size=spatial.dp_size if spatial else world_size,
+        rank=spatial.dp_rank if spatial else rank,
         data_workers=cfg.data_workers,
         well_base_path=cfg.data.well_base_path,
         field_index_map_override=cfg.data.get("field_index_map_override", {}),
@@ -214,7 +218,7 @@ def train(
                 checkpointer.load(
                     model,
                     local=cfg.distribution.distribution_type.upper()
-                    in ["LOCAL", "DDP"],
+                    in ["LOCAL", "DDP", "SPATIAL"],
                 )
             # Otherwise this is a resume load
             else:
@@ -223,7 +227,7 @@ def train(
                     model,
                     optimizer,
                     local=cfg.distribution.distribution_type.upper()
-                    in ["LOCAL", "DDP"],
+                    in ["LOCAL", "DDP", "SPATIAL"],
                 )
                 # Ensure initial_lr is set for each parameter group
                 for i, param_group in enumerate(optimizer.param_groups):
@@ -356,8 +360,10 @@ def main(cfg: DictConfig):
     config_for_wandb["world_size"] = world_size
     # Global batch size is microbatch size * number of GPUs * gradient accumulation steps
     # Though grad acc reduces the number of optimizer steps
+    spatial = get_spatial_context()
     config_for_wandb["global_batch_size"] = (
-        cfg.data.module_parameters.batch_size * world_size
+        cfg.data.module_parameters.batch_size
+        * (spatial.dp_size if spatial else world_size)
     ) * cfg.trainer.grad_acc_steps
     if rank == 0 and cfg.logger.wandb:
         wandb.init(

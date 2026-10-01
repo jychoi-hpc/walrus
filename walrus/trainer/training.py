@@ -32,6 +32,7 @@ from walrus.trainer.normalization_strat import (
     BaseRevNormalization,
     normalize_target,
 )
+from walrus.utils.spatial import get_spatial_context
 
 logger = logging.getLogger(__name__)
 
@@ -329,8 +330,8 @@ class Trainer:
         self.masked_loss_for_objects = masked_loss_for_objects
         self.amp_type = torch.bfloat16 if amp_type == "bfloat16" else torch.float16
         self.checkpointer = checkpointer
-        # If local or DDP, can use standard grad scaler
-        if distribution_type.upper() in ["LOCAL", "DDP"]:
+        # If local, DDP or spatial (replicated weights), can use standard grad scaler
+        if distribution_type.upper() in ["LOCAL", "DDP", "SPATIAL"]:
             self.grad_scaler = torch.GradScaler(
                 device=self.device.type, enabled=enable_amp and amp_type != "bfloat16"
             )
@@ -348,7 +349,12 @@ class Trainer:
         self.sampling_rank_strategy = sampling_rank_strategy
         self.reuse_batches = reuse_batches
         # Get derived rank info about which nodes must be synced from the device mesh
-        if self.device_mesh is not None and "fsdp" in self.device_mesh.mesh_dim_names:
+        self.spatial = get_spatial_context()
+        if self.spatial is not None:
+            # A spatial group shares each sample, like an FSDP group shares a dataset
+            self.sync_group = self.spatial.group
+            self.sync_group_size = self.spatial.size
+        elif self.device_mesh is not None and "fsdp" in self.device_mesh.mesh_dim_names:
             self.sync_group = self.device_mesh.get_group(mesh_dim="fsdp")
             self.sync_group_size = self.sync_group.size()
         else:  # Local or DDP
@@ -358,7 +364,14 @@ class Trainer:
         self.sync_group_rank = self.rank // self.sync_group_size
         self.rank_in_sync_group = self.rank % self.sync_group_size
         self.num_sync_groups = self.world_size // self.sync_group_size
-        if (
+        # FSDP group members split validation batches among themselves; spatial
+        # group members must all see the same batches.
+        self.eval_replicas = 1 if self.spatial else self.sync_group_size
+        self.eval_rank = 0 if self.spatial else self.rank_in_sync_group
+        if self.spatial is not None:
+            # Every GPU of a spatial group must draw the same training samples
+            self.sampling_rank = self.sync_group_rank
+        elif (
             self.sampling_rank_strategy == "gpu"
         ):  # This means sample different dataset per GPU
             self.sampling_rank = self.rank
@@ -394,7 +407,7 @@ class Trainer:
             validation_loss,
             epoch,
             force=last,
-            local=self.distribution_type.upper() in ["LOCAL", "DDP"],
+            local=self.distribution_type.upper() in ["LOCAL", "DDP", "SPATIAL"],
         )
         return checkpoint_future
 
@@ -914,6 +927,10 @@ class Trainer:
             logger.info(f"Rank {self.rank} passed barrier")
 
             # If we're distributed, gather all batchwise losses onto rank 0 for summarization and logging
+            if self.spatial is not None and self.rank_in_sync_group != 0:
+                # Spatial group members evaluated the same batches as their
+                # leader; only the leader's copy is counted.
+                rank_loss_dict, rank_time_logs = {}, {}
             object_loss_dict = {k: v.cpu() for k, v in rank_loss_dict.items()}
             loss_dicts = [None for _ in range(self.world_size)]
             time_logs_list = [None for _ in range(self.world_size)]
@@ -1272,13 +1289,13 @@ class Trainer:
 
             # Recreate loader every time so we're using same data in val
             val_dataloders = self.datamodule.val_dataloaders(
-                replicas=self.sync_group_size,
-                rank=self.rank_in_sync_group,
+                replicas=self.eval_replicas,
+                rank=self.eval_rank,
                 full=(epoch >= self.max_epoch and not self.debug_mode),
             )
             rollout_val_dataloaders = self.datamodule.rollout_val_dataloaders(
-                replicas=self.sync_group_size,
-                rank=self.rank_in_sync_group,
+                replicas=self.eval_replicas,
+                rank=self.eval_rank,
                 full=(epoch >= self.max_epoch and not self.debug_mode),
             )
             maybe_val_loss, rollout_loss = self.validate_if_necessary(
@@ -1297,11 +1314,11 @@ class Trainer:
                 )
         # Do test validation
         test_dataloaders = self.datamodule.test_dataloaders(
-            self.sync_group_size, rank=self.rank_in_sync_group, full=not self.debug_mode
+            self.eval_replicas, rank=self.eval_rank, full=not self.debug_mode
         )
         rollout_test_dataloaders = self.datamodule.rollout_test_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
+            replicas=self.eval_replicas,
+            rank=self.eval_rank,
             full=not self.debug_mode,
         )
         self.validate_if_necessary(
@@ -1311,23 +1328,23 @@ class Trainer:
     def validate(self):
         """Run validation and test. This is a stand alone path"""
         val_dataloders = self.datamodule.val_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
+            replicas=self.eval_replicas,
+            rank=self.eval_rank,
             full=not self.debug_mode,
         )
         rollout_val_dataloaders = self.datamodule.rollout_val_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
+            replicas=self.eval_replicas,
+            rank=self.eval_rank,
             full=not self.debug_mode,
         )
         test_dataloaders = self.datamodule.test_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
+            replicas=self.eval_replicas,
+            rank=self.eval_rank,
             full=not self.debug_mode,
         )
         rollout_test_dataloaders = self.datamodule.rollout_test_dataloaders(
-            replicas=self.sync_group_size,
-            rank=self.rank_in_sync_group,
+            replicas=self.eval_replicas,
+            rank=self.eval_rank,
             full=not self.debug_mode,
         )
         # Run validation and test

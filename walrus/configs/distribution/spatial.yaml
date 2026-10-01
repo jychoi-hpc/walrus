@@ -1,0 +1,4 @@
+distribution_type: spatial
+local_size:
+spatial_size: # GPUs per spatial group; defaults to the GPUs per node (LOCAL_WORLD_SIZE)
+spatial_axis: 0 # Axis split across the group (0 = x)

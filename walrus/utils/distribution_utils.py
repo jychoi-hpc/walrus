@@ -9,6 +9,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy, size_based_auto_wrap_policy
 
+from walrus.utils.spatial import DATA_PARALLEL_DIM, SPATIAL_DIM, set_spatial_context
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +34,18 @@ def configure_distribution(cfg):
     # device_mesh, but I got errors until I set it in train.py.
     if cfg.distribution.distribution_type.upper() == "LOCAL":
         return None
+    elif cfg.distribution.distribution_type.upper() == "SPATIAL":
+        spatial_size = int(cfg.distribution.get("spatial_size") or local_world_size)
+        if world_size % spatial_size != 0:
+            raise ValueError(
+                f"World size {world_size} is not a multiple of spatial_size {spatial_size}"
+            )
+        mesh = init_device_mesh(
+            "cuda",
+            (world_size // spatial_size, spatial_size),
+            mesh_dim_names=(DATA_PARALLEL_DIM, SPATIAL_DIM),
+        )
+        set_spatial_context(mesh, axis=int(cfg.distribution.get("spatial_axis", 0)))
     elif cfg.distribution.distribution_type.upper() == "HSDP":
         # HSDP is DDP across nodes, FSDP within nodes - useful if  intra-node xfer speed >>> inter-node xfer speed
         mesh = init_device_mesh(
@@ -68,7 +82,7 @@ def distribute_model(model, cfg, mesh=None):
     # If no mesh is provided, there is no valid distribution strategy
     if mesh is None:
         return model
-    elif cfg.distribution.distribution_type.upper() in ["FSDP", "HSDP", "DDP"]:
+    elif cfg.distribution.distribution_type.upper() in ["FSDP", "HSDP", "DDP", "SPATIAL"]:
         # FSDP and HSDP both use FSDP API, so need to build in AMP if we're going to use it.
         if cfg.trainer.enable_amp:
             fpSixteen = MixedPrecision(
@@ -86,12 +100,12 @@ def distribute_model(model, cfg, mesh=None):
             sharding = ShardingStrategy.FULL_SHARD
         elif cfg.distribution.distribution_type.upper() == "HSDP":
             sharding = ShardingStrategy.HYBRID_SHARD
-        elif cfg.distribution.distribution_type.upper() == "DDP":
+        elif cfg.distribution.distribution_type.upper() in ["DDP", "SPATIAL"]:
             sharding = ShardingStrategy.NO_SHARD
         # TODO - should make this configurable at some point, but this
         # is a good default for now. Shards per block where block is the encoder, decoder,
         # or processor. For larger enc/dec it probably makes sense to have more blocks.
-        if cfg.distribution.distribution_type.upper() != "DDP":
+        if cfg.distribution.distribution_type.upper() not in ["DDP", "SPATIAL"]:
             if (
                 hasattr(cfg.model, "encoder")
                 and hasattr(cfg.model, "decoder")
@@ -119,11 +133,17 @@ def distribute_model(model, cfg, mesh=None):
             auto_wrap_policy=wrap_policy,
             mixed_precision=fpSixteen,
             sharding_strategy=sharding,
-            device_mesh=mesh,
+            # Spatial: weights are replicated and gradients averaged over all
+            # ranks (the default group). Until layers split the domain, every
+            # rank in a spatial group sees the same batch, so this average is
+            # the data-parallel average.
+            device_mesh=None
+            if cfg.distribution.distribution_type.upper() == "SPATIAL"
+            else mesh,
             use_orig_params=True,
         )
     else:
         raise ValueError(
-            f"Unknown distribution type {cfg.distribution.distribution_type} - must be LOCAL, DDP, FSDP, or HSDP"
+            f"Unknown distribution type {cfg.distribution.distribution_type} - must be LOCAL, DDP, FSDP, HSDP or SPATIAL"
         )
     return model
