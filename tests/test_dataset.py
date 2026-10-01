@@ -295,3 +295,20 @@ def test_dummy_resized_datamodule(dummy_resized_datamodule, dummy_control_datamo
         control_rollout_batch = next(iter(control_rollout))
         _compare_samples(resized_rollout_batch, control_rollout_batch, resize_shape)
     # Test uses the same path as val so ignore for now
+
+
+def test_dataset_kws_from_hydra_config(dummy_dataset):
+    """dataset_kws given as an OmegaConf DictConfig (as Hydra passes it) reaches the datasets."""
+    from omegaconf import OmegaConf
+
+    data_module = MixedWellDataModule(
+        well_base_path=dummy_dataset,
+        well_dataset_info={
+            "dummy": {"path": dummy_dataset / "dummy", "include_filters": [], "exclude_filters": []},
+        },
+        batch_size=1,
+        data_workers=0,
+        dataset_kws=OmegaConf.create({"slab": [0, 8, 24]}),
+    )
+    sample = data_module.train_dataset[[0]]
+    assert sample["input_fields"].shape[2] == 16  # B T [X] ...: only the slab's 16 x-points

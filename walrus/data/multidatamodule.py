@@ -3,6 +3,7 @@ from functools import partial
 from typing import Dict, List, Literal, Optional, Union
 
 import torch
+from omegaconf import DictConfig, OmegaConf
 from the_well.data import WellDataset
 from the_well.data.augmentation import Augmentation
 from torch.utils.data import (
@@ -204,6 +205,9 @@ class MixedWellDataModule:
             )
 
         if dataset_kws is not None:
+            # Hydra passes configs as DictConfig
+            if isinstance(dataset_kws, DictConfig):
+                dataset_kws = OmegaConf.to_container(dataset_kws, resolve=True)
             # If dataset_kws is not a dict, raise an error
             if not isinstance(dataset_kws, dict):
                 raise ValueError(
