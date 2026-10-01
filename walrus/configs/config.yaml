@@ -13,5 +13,6 @@ defaults:
   - finetuning_mods: defaults
 data_workers: 14
 name: default_name
+seed: # Optional: seed torch and numpy before building data and model (reproducible runs)
 finetune: False
 automatic_setup: True

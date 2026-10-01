@@ -4,6 +4,7 @@ import pathlib
 from typing import Dict, Optional, cast
 
 import hydra
+import numpy as np
 import torch
 import wandb
 from hydra.utils import get_method, instantiate
@@ -83,6 +84,9 @@ def train(
     device_mesh: Optional[torch.distributed.device_mesh.DeviceMesh] = None,
 ):
     """Instantiate the different objects required for training and run the training loop."""
+    if cfg.get("seed") is not None:
+        torch.manual_seed(cfg.seed)
+        np.random.seed(cfg.seed)
     logger.info(f"Instantiate datamodule {cfg.data.wandb_data_name}")
     # With spatial parallelism, every GPU of a spatial group reads the same
     # samples: data is split only across groups.

@@ -16,7 +16,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 
-from walrus.utils.spatial import SpatialContext
+from walrus.utils.spatial import SpatialContext, collectives_on_cuda
 
 
 def _slab_widths(n_local: int, ctx: SpatialContext, device) -> List[int]:
@@ -27,7 +27,7 @@ def _slab_widths(n_local: int, ctx: SpatialContext, device) -> List[int]:
 
 
 def _comm_device(ctx: SpatialContext, like: torch.Tensor):
-    return like.device if dist.get_backend(ctx.group) != "gloo" else torch.device("cpu")
+    return like.device if collectives_on_cuda(ctx) else torch.device("cpu")
 
 
 def _send_recv(ctx: SpatialContext, sends: List[torch.Tensor], recvs: List[torch.Tensor]):
@@ -147,7 +147,7 @@ def shared_randint(low: int, high: int, ctx: SpatialContext, device=None) -> int
     """Random integer in [low, high), the same on every GPU of the group (drawn
     on the group's first rank with torch's generator and broadcast)."""
     value = torch.randint(low, high, (1,), device="cpu")
-    if dist.get_backend(ctx.group) != "gloo":
+    if collectives_on_cuda(ctx):
         value = value.to(device or torch.device("cuda", torch.cuda.current_device()))
     dist.broadcast(value, src=dist.get_global_rank(ctx.group, 0), group=ctx.group)
     return int(value)

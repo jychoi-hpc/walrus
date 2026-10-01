@@ -169,10 +169,14 @@ def distribute_model(model, cfg, mesh=None):
             auto_wrap_policy=wrap_policy,
             mixed_precision=fpSixteen,
             sharding_strategy=sharding,
-            # Spatial: weights are replicated and gradients averaged over all
-            # ranks (the default group). Until layers split the domain, every
-            # rank in a spatial group sees the same batch, so this average is
-            # the data-parallel average.
+            # Replicated weights (DDP, spatial) must start equal on every rank:
+            # nothing seeds the generator, so each process initializes its own
+            # model. Broadcast rank 0's parameters and buffers.
+            sync_module_states=(sharding == ShardingStrategy.NO_SHARD),
+            # Spatial: gradients are averaged over all ranks (the default
+            # group). With a split domain each rank's loss is its slab's share
+            # times the group size, so this average sums over each group and
+            # averages over groups.
             device_mesh=None
             if cfg.distribution.distribution_type.upper() == "SPATIAL"
             else mesh,

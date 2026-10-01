@@ -138,11 +138,18 @@ def gather_slabs(x_local: torch.Tensor, dim: int, ctx: SpatialContext) -> torch.
     return torch.cat([p.narrow(dim, 0, w) for p, w in zip(parts, widths)], dim=dim)
 
 
+def collectives_on_cuda(ctx: SpatialContext) -> bool:
+    """Whether the group communicates through NCCL (CUDA tensors). Uses the
+    backend config ("nccl", "cuda:nccl", "cpu:gloo", ...): get_backend reports
+    "undefined" for groups created through a device mesh."""
+    return "nccl" in str(dist.get_backend_config(ctx.group))
+
+
 def slab_offset_and_total(n_local: int, ctx: SpatialContext) -> Tuple[int, int]:
     """Start of this rank's slab along the split axis and the axis's full
     length, from the local lengths of all slabs of the group."""
     local = torch.tensor([n_local], dtype=torch.long)
-    if dist.get_backend(ctx.group) == "nccl":
+    if collectives_on_cuda(ctx):
         local = local.cuda()
     widths = [torch.empty_like(local) for _ in range(ctx.size)]
     dist.all_gather(widths, local, group=ctx.group)
