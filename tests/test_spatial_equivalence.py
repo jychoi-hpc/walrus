@@ -428,3 +428,62 @@ def test_jitter_differs_without_split():
     reports = check_spatial_equivalence(partial(JitterEncodeDecode, [3, 1, -2]), JITTER_SHAPE,
                                         split_dim=3, align=4)
     assert not all(r["output"][2] for r in reports)
+
+
+# t204: the real Walrus encoder and decoder on slabs
+class EncodeDecode(nn.Module):
+    """SpaceBagAdaptiveDVstrideEncoder -> AdaptiveDVstrideDecoder with RMSGroupNorm,
+    as in the Walrus model, scaled down. Along x (split, periodic) kernels equal
+    strides (as for patch 32 from (8, 4) kernels); along y (wall) the first
+    kernel is wider than its stride, like Walrus's y patch. Input: T B C x y z."""
+
+    def __init__(self, x_kernels=(2, 2)):
+        from walrus.models.decoders.vstride_decoder import AdaptiveDVstrideDecoder
+        from walrus.models.encoders.vstride_encoder import SpaceBagAdaptiveDVstrideEncoder
+        from walrus.models.shared_utils.normalization import RMSGroupNorm
+
+        super().__init__()
+        torch.manual_seed(6)
+        kernels = (x_kernels, (3, 2), (2, 2))
+        self.encoder = SpaceBagAdaptiveDVstrideEncoder(
+            kernel_scales_seq=((2, 2),), base_kernel_size3d=kernels, input_dim=7,
+            inner_dim=8, output_dim=12, spatial_dims=3, groups=2,
+            norm_layer=RMSGroupNorm, activation=nn.SiLU)
+        self.decoder = AdaptiveDVstrideDecoder(
+            base_kernel_size3d=kernels, input_dim=12, inner_dim=8, output_dim=4,
+            spatial_dims=3, groups=2, norm_layer=RMSGroupNorm, activation=nn.SiLU)
+
+    def forward(self, x):
+        from the_well.data.datasets import BoundaryCondition as BC
+
+        strides = ((2, 2), (2, 2), (2, 2))
+        bcs = [[BC.PERIODIC.value] * 2, [BC.WALL.value] * 2, [BC.PERIODIC.value] * 2]
+        tokens, info = self.encoder(x, torch.arange(7), bcs, random_kernel=strides)
+        return self.decoder(tokens, torch.arange(4), bcs, stage_info=info)
+
+
+ENCDEC_SHAPE = (1, 2, 7, 40, 9, 8)  # T B C x y z; x slabs 12/12/8/8 = whole 4-point patches
+
+
+def test_walrus_encoder_decoder_are_equivalent_on_slabs():
+    assert_spatially_equivalent(EncodeDecode, ENCDEC_SHAPE, split_dim=3, align=4,
+                                make_spatial_module=split)
+
+
+def test_walrus_encoder_decoder_differ_without_split():
+    # The norms inside need the split; without it the slabs normalize alone
+    reports = check_spatial_equivalence(EncodeDecode, ENCDEC_SHAPE, split_dim=3, align=4)
+    assert not all(r["output"][2] for r in reports)
+
+
+def _encoder_with_wide_x_kernel(ctx):
+    model = split(EncodeDecode(x_kernels=(3, 2)))
+    try:
+        model(torch.randn(1, 2, 7, 12, 9, 8))
+    except NotImplementedError as err:
+        return "halo" in str(err)
+    return False
+
+
+def test_encoder_refuses_split_axis_kernel_wider_than_stride():
+    assert all(run_on_spatial_group(_encoder_with_wide_x_kernel))

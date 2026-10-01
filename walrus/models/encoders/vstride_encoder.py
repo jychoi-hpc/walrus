@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
+from walrus.utils.spatial import check_patch_aligned
+
 CONV_FUNCS = {
     1: (nn.Conv1d, F.conv1d),
     2: (nn.Conv2d, F.conv2d),
@@ -228,6 +230,8 @@ class AdaptiveDVstrideEncoder(nn.Module):
 
         # Normalization layer after the second convolutional layer
         self.norm2 = norm_layer(groups, output_dim, affine=True)
+        # Set by walrus.utils.spatial.enable_domain_split: inputs are slabs
+        self.spatial_ctx = None
 
     def adaptive_conv(
         self,
@@ -280,6 +284,10 @@ class AdaptiveDVstrideEncoder(nn.Module):
 
         padding1 = cast(Tuple[int, ...], padding1)  # type: ignore
         padding2 = cast(Tuple[int, ...], padding2)  # type: ignore
+        check_patch_aligned(self.spatial_ctx, x.shape[3 + self.spatial_ctx.axis]
+                            if self.spatial_ctx else 0,
+                            (self.base_kernel1, self.base_kernel2), (stride1, stride2),
+                            (padding1, padding2))
 
         # Apply the first convolution
         weight1 = self.proj1.weight
@@ -344,6 +352,10 @@ class SpaceBagAdaptiveDVstrideEncoder(AdaptiveDVstrideEncoder):
 
         padding1 = cast(Tuple[int, ...], padding1)  # type: ignore
         padding2 = cast(Tuple[int, ...], padding2)  # type: ignore
+        check_patch_aligned(self.spatial_ctx, x.shape[3 + self.spatial_ctx.axis]
+                            if self.spatial_ctx else 0,
+                            (self.base_kernel1, self.base_kernel2), (stride1, stride2),
+                            (padding1, padding2))
 
         # Apply the first convolution
         weight1 = self.proj1.weight[:, field_indices]

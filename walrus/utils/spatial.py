@@ -162,3 +162,27 @@ def enable_domain_split(model: "torch.nn.Module", ctx: Optional[SpatialContext] 
         if hasattr(module, "spatial_ctx"):
             module.spatial_ctx = ctx
     return model
+
+
+def check_patch_aligned(ctx: Optional[SpatialContext], length: int, kernels, strides,
+                        paddings=None) -> None:
+    """On a split domain, a strided (transposed) convolution stack runs on each
+    slab without communication only if, along the split axis, every kernel
+    equals its stride, there is no padding, and the slab holds whole patches.
+    Raise otherwise (a halo exchange would be needed)."""
+    if ctx is None or ctx.size == 1:
+        return
+    a = ctx.axis
+    for k, s in zip(kernels, strides):
+        if k[a] != s[a]:
+            raise NotImplementedError(
+                f"kernel {k[a]} != stride {s[a]} along the split axis needs a halo exchange"
+            )
+    for p in paddings or []:
+        if p[a]:
+            raise NotImplementedError("padding along the split axis needs a halo exchange")
+    patch = 1
+    for s in strides:
+        patch *= s[a]
+    if length % patch:
+        raise ValueError(f"slab of {length} points is not a whole number of {patch}-point patches")

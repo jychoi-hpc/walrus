@@ -9,6 +9,8 @@ from einops import rearrange
 from the_well.data.datasets import BoundaryCondition
 from torch import Tensor
 
+from walrus.utils.spatial import check_patch_aligned
+
 CONV_FUNCS = {
     1: (nn.ConvTranspose1d, F.conv_transpose1d),
     2: (nn.ConvTranspose2d, F.conv_transpose2d),
@@ -206,6 +208,8 @@ class AdaptiveDVstrideDecoder(nn.Module):
             output_dim,
             kernel_size=self.base_kernel2,  # type: ignore
         )
+        # Set by walrus.utils.spatial.enable_domain_split: inputs are slabs
+        self.spatial_ctx = None
 
     def adaptive_conv_transpose(self, x, bcs, weight, bias, stride, padding):
         spatial_dims = x.shape[-self.spatial_dims :]
@@ -284,6 +288,9 @@ class AdaptiveDVstrideDecoder(nn.Module):
 
         padding1 = cast(Tuple[int, ...], padding1)  # type: ignore
         padding2 = cast(Tuple[int, ...], padding2)  # type: ignore
+        # Input is tokens, so only kernels, strides and padding are checked
+        check_patch_aligned(self.spatial_ctx, 0, (self.base_kernel1, self.base_kernel2),
+                            (stride1, stride2), (padding1, padding2))
 
         # x is (T, B, C, H, W, D)
         # state_labels is (C_in)
