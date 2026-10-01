@@ -226,10 +226,13 @@ class AdaptiveDVstrideDecoder(nn.Module):
                 padding[-i] = 0
             k = weight.shape[-i]  # Shape of the kernel in the given dim
             s = stride[-i]
-            pad_in = (
-                (k - s) // s
-            )  # TODO (mm) - This might get messed up for future non-divisible cases
-            pad_out = k - s
+            pad_in = (k - s) // s  # whole input tokens of circular padding
+            # Crop exactly what the circular padding added (pad_in tokens of s
+            # points each side). Cropping k - s instead is only the same when
+            # k - s is a multiple of s; for stride 6 with kernel 8 (patch 24 or
+            # 12: 384- or 192-point periodic axes) it cut 2 points too many on
+            # each side and the output came out 4 points short.
+            pad_out = pad_in * s
             # if dist.get_rank() == 0:
             #     print("wtf is going on", i, dim, bcs)
             # NOTE - if dim = 1, padding is already 0, but this is more explicit.
