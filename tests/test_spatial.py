@@ -149,3 +149,37 @@ def test_setup_env_without_slurm_does_nothing(monkeypatch):
 def test_no_context_without_spatial_mode():
     clear_spatial_context()
     assert get_spatial_context() is None
+
+
+class _TwoDatasets:
+    """Stand-in for MixedWellDataset with the fields BatchedMultisetSampler reads."""
+
+    sub_dsets = [list(range(10)), list(range(7))]
+    offsets = [0, 10]
+    effective_batch_sizes = [1.0, 1.0]
+
+
+def _draw(base_sampler, rank, process_seed):
+    from walrus.data.mixed_dset_sampler import BatchedMultisetSampler
+
+    torch.manual_seed(process_seed)  # each process's global RNG differs
+    sampler = BatchedMultisetSampler(
+        _TwoDatasets(), base_sampler, batch_size=2, max_samples=6, rank=rank
+    )
+    return list(sampler)
+
+
+def test_group_seeded_sampler_ignores_process_rng():
+    from functools import partial
+
+    from torch.utils.data import RandomSampler
+
+    def seeded(rank):
+        return partial(RandomSampler, generator=torch.Generator().manual_seed(rank))
+
+    # Same spatial group (same rank), different process RNG: same batches
+    assert _draw(seeded(0), 0, process_seed=1) == _draw(seeded(0), 0, process_seed=2)
+    # Different groups: different batches
+    assert _draw(seeded(0), 0, process_seed=1) != _draw(seeded(1), 1, process_seed=1)
+    # The unseeded sampler (the bug) follows the process RNG
+    assert _draw(RandomSampler, 0, process_seed=1) != _draw(RandomSampler, 0, process_seed=2)

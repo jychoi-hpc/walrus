@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Dict, List, Literal, Optional, Union
 
 import torch
@@ -16,6 +17,7 @@ from torch.utils.data._utils.collate import default_collate
 from walrus.data.inflated_dataset import (
     BatchInflatedWellDataset,
 )
+from walrus.utils.spatial import get_spatial_context
 
 from .mixed_dset_sampler import BatchedMultisetSampler
 from .multidataset import MixedWellDataset
@@ -408,8 +410,20 @@ class MixedWellDataModule:
         return self.world_size > 1
 
     def train_dataloader(self, rank_override=None) -> DataLoader:
+        rank = self.rank if rank_override is None else rank_override
         if self.allow_sharding_in_train and self.is_distributed:
             base_sampler: type[Sampler] = DistributedSampler
+            if get_spatial_context() is not None:
+                # Shard over spatial groups, not over all GPUs
+                base_sampler = partial(
+                    DistributedSampler, num_replicas=self.world_size, rank=rank
+                )
+        elif get_spatial_context() is not None:
+            # GPUs of a spatial group must draw the same samples, so seed the
+            # shuffle by group instead of each process's global RNG
+            base_sampler = partial(
+                RandomSampler, generator=torch.Generator().manual_seed(rank)
+            )
         else:
             base_sampler = RandomSampler
 
@@ -421,7 +435,7 @@ class MixedWellDataModule:
             max_samples=self.max_samples,  # TODO Fix max_samples later
             recycle=self.recycle,
             drop_last=False,
-            rank=self.rank if rank_override is None else rank_override,
+            rank=rank,
         )
 
         shuffle = sampler is None

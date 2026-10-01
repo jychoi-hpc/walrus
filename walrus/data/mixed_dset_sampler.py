@@ -35,10 +35,7 @@ class MultisetSampler(Sampler[int]):
         self.sub_dsets = dataset.sub_dsets
         self.base_sampler = base_sampler
         self.recycle = recycle
-        if (
-            "drop_last"
-            in inspect.signature(getattr(base_sampler, "__init__")).parameters
-        ):
+        if "drop_last" in inspect.signature(base_sampler).parameters:
             self.sub_samplers = [
                 base_sampler(dataset, drop_last=drop_last)  # type: ignore
                 for dataset in self.sub_dsets
@@ -146,10 +143,7 @@ class BatchedMultisetSampler(Sampler[int]):
         self.sub_dsets = dataset.sub_dsets
         self.base_sampler = base_sampler
         self.recycle = recycle
-        if (
-            "drop_last"
-            in inspect.signature(getattr(base_sampler, "__init__")).parameters
-        ):
+        if "drop_last" in inspect.signature(base_sampler).parameters:
             self.sub_samplers = [
                 base_sampler(dataset, drop_last=drop_last)  # type: ignore
                 for dataset in self.sub_dsets
