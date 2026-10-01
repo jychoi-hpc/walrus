@@ -25,6 +25,12 @@ def assign_slabs(datamodule, ctx: SpatialContext) -> None:
     edges fall on multiples of the patch size chosen for the full grid, so
     every patch lies within one slab."""
     for dataset in _datasets(datamodule):
+        if getattr(dataset, "transform", None) is not None:
+            # A transform of one slab (e.g. a resize) is not the slab of the
+            # transformed sample
+            raise NotImplementedError(
+                f"{dataset.metadata.dataset_name}: data transforms on a split domain"
+            )
         shape = tuple(dataset.metadata.spatial_resolution)
         kernels = choose_kernel_size_deterministic(shape)
         patch = kernels[ctx.axis][0] * kernels[ctx.axis][1]
