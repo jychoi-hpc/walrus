@@ -1,4 +1,3 @@
-import copy
 import gc
 import logging
 import os
@@ -409,9 +408,11 @@ class Trainer:
         """
 
         metadata = batch["metadata"]
+        # space_grid is never read past this point; at full resolution it is
+        # several GB, so it stays on the host.
         batch = {
             k: v.to(self.device, non_blocking=True)
-            if k not in {"metadata", "boundary_conditions"}
+            if k not in {"metadata", "boundary_conditions", "space_grid"}
             else v
             for k, v in batch.items()
         }
@@ -448,7 +449,10 @@ class Trainer:
             raise ValueError("Multiple step prediction in train mode not yet supported")
         y_ref = y_ref[:, :rollout_steps]
         # Create a moving batch of one step at a time
-        moving_batch = copy.deepcopy(batch)
+        # A shallow copy is enough: the loop below only rebinds
+        # moving_batch["input_fields"] and never modifies tensors in place.
+        # A deepcopy would duplicate every field on the GPU.
+        moving_batch = dict(batch)
         y_preds = []
         # Fake pass is just a convenience for distributed validation without communcation code
         if fake_pass:
