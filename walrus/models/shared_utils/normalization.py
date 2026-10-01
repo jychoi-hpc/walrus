@@ -1,6 +1,11 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.nn.functional import all_reduce
+
+from walrus.utils.spatial import SpatialContext
 
 
 def get_spatial_dims(n_dims: int, include_time: bool):
@@ -9,6 +14,23 @@ def get_spatial_dims(n_dims: int, include_time: bool):
     if include_time:
         start += 1
     return list(range(start, start + n_dims))
+
+
+def spatial_rms_norm(x: torch.Tensor, ctx: SpatialContext) -> torch.Tensor:
+    """Same as F.rms_norm(x, x.shape[3:]) - for x (B, groups, channels per
+    group, *space) that is the RMS of each channel over space - when space is
+    split into slabs over ctx.group: the sum of squares and the point count are
+    summed over the group, so every slab is scaled by the RMS of the whole
+    domain. Uses F.rms_norm's default eps (finfo(dtype).eps)."""
+    reduce_dims = tuple(range(3, x.dim()))
+    # Accumulate in at least float32 (half-precision inputs under AMP)
+    acc_dtype = torch.promote_types(x.dtype, torch.float32)
+    sum_sq = torch.linalg.vector_norm(x, ord=2, dim=reduce_dims, dtype=acc_dtype).square()
+    sum_sq = all_reduce(sum_sq, group=ctx.group)  # differentiable
+    count = torch.tensor(float(math.prod(x.shape[3:])), device=x.device)
+    torch.distributed.all_reduce(count, group=ctx.group)
+    inv_rms = torch.rsqrt(sum_sq / count + torch.finfo(x.dtype).eps)
+    return x * inv_rms.to(x.dtype).view(*inv_rms.shape, *([1] * len(reduce_dims)))
 
 
 class RMSGroupNorm(nn.Module):
@@ -85,6 +107,9 @@ class RMSGroupNorm(nn.Module):
             self.register_parameter("weight", None)
 
         self.reset_parameters()
+        # Set by walrus.utils.spatial.enable_domain_split: the input is then one
+        # slab of the domain and the statistics are summed over the group.
+        self.spatial_ctx: SpatialContext | None = None
 
     def reset_parameters(self) -> None:
         if self.affine:
@@ -95,7 +120,10 @@ class RMSGroupNorm(nn.Module):
         dims = list(input.shape[2:])
         input = input.view(input.shape[0], self.num_groups, -1, *dims)
         norm_shape = input.shape[3:]
-        input = F.rms_norm(input, normalized_shape=norm_shape)
+        if self.spatial_ctx is not None and self.spatial_ctx.size > 1:
+            input = spatial_rms_norm(input, self.spatial_ctx)
+        else:
+            input = F.rms_norm(input, normalized_shape=norm_shape)
         input = input.view(input.shape[0], -1, *dims)
         if self.weight is not None:
             indexing_tuple = (slice(None),) + (None,) * len(dims)

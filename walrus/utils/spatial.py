@@ -3,6 +3,8 @@ one axis, one slab per GPU of a spatial group. Every GPU in a group sees the
 same batch; data parallelism runs across groups.
 
 Layers that need to communicate look up the group with get_spatial_context().
+A layer only communicates once enable_domain_split() has marked it: until the
+model runs on slabs, every GPU of a group holds the whole sample.
 """
 
 import logging
@@ -134,3 +136,17 @@ def gather_slabs(x_local: torch.Tensor, dim: int, ctx: SpatialContext) -> torch.
     parts = [torch.empty_like(padded) for _ in range(ctx.size)]
     dist.all_gather(parts, padded.contiguous(), group=ctx.group)
     return torch.cat([p.narrow(dim, 0, w) for p, w in zip(parts, widths)], dim=dim)
+
+
+def enable_domain_split(model: "torch.nn.Module", ctx: Optional[SpatialContext] = None):
+    """Mark every layer of `model` that supports it (has a `spatial_ctx`
+    attribute) to treat its input as this GPU's slab and communicate over the
+    spatial group. Stored on the modules, so it also holds when gradient
+    checkpointing re-runs the forward during backward. Returns the model."""
+    ctx = ctx or get_spatial_context()
+    if ctx is None:
+        raise RuntimeError("no spatial context: configure distribution=spatial first")
+    for module in model.modules():
+        if hasattr(module, "spatial_ctx"):
+            module.spatial_ctx = ctx
+    return model

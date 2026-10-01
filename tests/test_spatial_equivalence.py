@@ -93,3 +93,46 @@ def test_harness_catches_missing_all_reduce():
     reports = check_spatial_equivalence(Center, SHAPE, split_dim=2)
     assert not all(r["output"][2] for r in reports)
     assert not all(r["grad scale"][2] for r in reports)
+
+
+# t205: RMSGroupNorm across the spatial group
+def rms_group_norm():
+    from walrus.models.shared_utils.normalization import RMSGroupNorm
+
+    torch.manual_seed(1)
+    norm = RMSGroupNorm(num_groups=2, num_channels=4)
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)  # non-trivial weights so their gradient is tested
+    return norm
+
+
+def patch_conv_then_norm():
+    return nn.Sequential(patch_conv(), rms_group_norm_6(), nn.GELU())
+
+
+def rms_group_norm_6():
+    from walrus.models.shared_utils.normalization import RMSGroupNorm
+
+    return RMSGroupNorm(num_groups=3, num_channels=6)
+
+
+def split(model):
+    from walrus.utils.spatial import enable_domain_split
+
+    return enable_domain_split(model)
+
+
+@pytest.mark.parametrize("n_points", [32, 40])
+def test_rms_group_norm_is_equivalent_when_split(n_points):
+    assert_spatially_equivalent(rms_group_norm, (2, 4, n_points, 8, 8), split_dim=2,
+                                align=4, make_spatial_module=split)
+
+
+def test_rms_group_norm_differs_without_split():
+    reports = check_spatial_equivalence(rms_group_norm, SHAPE, split_dim=2)
+    assert not all(r["output"][2] for r in reports)
+
+
+def test_patch_conv_and_norm_stack_is_equivalent():
+    assert_spatially_equivalent(patch_conv_then_norm, (2, 4, 40, 8, 8), split_dim=2,
+                                align=4, make_spatial_module=split)
