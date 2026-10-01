@@ -26,19 +26,18 @@ def _first_host(nodelist: str) -> str:
 
 def setup_env_from_slurm():
     """Under `srun` (one task per GPU), fill the torch.distributed variables
-    RANK, WORLD_SIZE, LOCAL_RANK, LOCAL_WORLD_SIZE, MASTER_ADDR and
-    MASTER_PORT from Slurm's. Variables already set (e.g. by torchrun) win."""
+    from Slurm's: RANK <- SLURM_PROCID, WORLD_SIZE <- SLURM_NTASKS,
+    LOCAL_RANK <- SLURM_LOCALID, LOCAL_WORLD_SIZE <- SLURM_NTASKS_PER_NODE,
+    plus MASTER_ADDR and MASTER_PORT. Variables already set (e.g. by
+    torchrun) win."""
     env = os.environ
     if "SLURM_PROCID" not in env:
         return
-    tasks_per_node = env.get("SLURM_NTASKS_PER_NODE") or env.get(
-        "SLURM_TASKS_PER_NODE", "1"
-    ).split("(")[0]
     defaults = {
         "RANK": env["SLURM_PROCID"],
         "WORLD_SIZE": env.get("SLURM_NTASKS", "1"),
         "LOCAL_RANK": env.get("SLURM_LOCALID", "0"),
-        "LOCAL_WORLD_SIZE": tasks_per_node,
+        "LOCAL_WORLD_SIZE": env.get("SLURM_NTASKS_PER_NODE", "1"),
         # Rank 0 runs on the first node of the step. (Not the launch node: under
         # salloc that is the login node.)
         "MASTER_ADDR": _first_host(
