@@ -84,7 +84,8 @@ def _compare(name, got, want, atol, rtol, report: Report):
 
 
 def _check_on_rank(ctx: SpatialContext, make_module, make_spatial_module, input_shape,
-                   split_dim, out_split_dim, align, seed, atol, rtol) -> Report:
+                   split_dim, out_split_dim, align, seed, atol, rtol,
+                   output_is_partial_sum=False) -> Report:
     torch.manual_seed(seed)
     reference = make_module().double()
     spatial = (make_spatial_module or (lambda m: m))(copy.deepcopy(reference)).double()
@@ -104,6 +105,15 @@ def _check_on_rank(ctx: SpatialContext, make_module, make_spatial_module, input_
     report: Report = {}
     if out_split_dim is None:  # output not split (e.g. a reduction)
         y_ref, upstream_local = y, upstream
+        if output_is_partial_sum:  # e.g. a loss: the slabs' outputs add up
+            total = y_local.detach().clone()
+            dist.all_reduce(total, group=ctx.group)
+            _compare("output (summed over group)", total, y.detach(), atol, rtol, report)
+            (y_local * upstream_local).sum().backward()
+            _compare("input grad", x_local.grad,
+                     x.grad.narrow(split_dim, start, stop - start), atol, rtol, report)
+            _compare_param_grads(ctx, reference, spatial, atol, rtol, report)
+            return report
     else:
         widths: List[Optional[int]] = [None] * ctx.size
         dist.all_gather_object(widths, y_local.shape[out_split_dim], group=ctx.group)
@@ -118,12 +128,16 @@ def _check_on_rank(ctx: SpatialContext, make_module, make_spatial_module, input_
     _compare("input grad", x_local.grad,
              x.grad.narrow(split_dim, start, stop - start), atol, rtol, report)
 
+    _compare_param_grads(ctx, reference, spatial, atol, rtol, report)
+    return report
+
+
+def _compare_param_grads(ctx, reference, spatial, atol, rtol, report):
     ref_params = dict(reference.named_parameters())
     for name, p in spatial.named_parameters():
         grad = p.grad.clone() if p.grad is not None else torch.zeros_like(p)
         dist.all_reduce(grad, group=ctx.group)
         _compare(f"grad {name}", grad, ref_params[name].grad, atol, rtol, report)
-    return report
 
 
 def check_spatial_equivalence(
@@ -133,6 +147,7 @@ def check_spatial_equivalence(
     align: int = 1,
     make_spatial_module: Optional[Callable[[nn.Module], nn.Module]] = None,
     out_split_dim: Optional[int] = -1,
+    output_is_partial_sum: bool = False,
     world_size: int = 4,
     seed: int = 0,
     atol: float = 1e-10,
@@ -140,13 +155,17 @@ def check_spatial_equivalence(
 ) -> List[Report]:
     """Per-rank reports comparing make_spatial_module(module) on slabs with
     make_module() on the full grid. out_split_dim: dimension along which the
-    output is split (-1: same as split_dim; None: output is not split)."""
+    output is split (-1: same as split_dim; None: output is not split).
+    output_is_partial_sum (with out_split_dim=None): each rank's output is its
+    share of the full output (e.g. a loss), so outputs are summed over the group
+    before comparing."""
     if out_split_dim == -1:
         out_split_dim = split_dim
     fn = partial(_check_on_rank, make_module=make_module,
                  make_spatial_module=make_spatial_module, input_shape=tuple(input_shape),
                  split_dim=split_dim, out_split_dim=out_split_dim, align=align,
-                 seed=seed, atol=atol, rtol=rtol)
+                 seed=seed, atol=atol, rtol=rtol,
+                 output_is_partial_sum=output_is_partial_sum)
     return run_on_spatial_group(fn, world_size=world_size)
 
 

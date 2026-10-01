@@ -7,6 +7,8 @@ from the_well.data.utils import flatten_field_names
 
 from walrus.data.multidataset import MixedWellDataset
 from walrus.data.well_to_multi_transformer import AbstractFormatter
+from walrus.trainer.spatial_reductions import global_mean, global_std_mean
+from walrus.utils.spatial import SpatialContext
 
 
 @dataclass
@@ -25,8 +27,25 @@ class NormalizationStats:
 
 
 class BaseRevNormalization:
+    # Set when each GPU holds one slab of the domain: samplewise statistics
+    # are then taken over the whole domain across the spatial group.
+    spatial_ctx: Optional[SpatialContext] = None
+
     def __init__(self, *args, **kwargs):
         pass
+
+    def _split(self) -> bool:
+        return self.spatial_ctx is not None and self.spatial_ctx.size > 1
+
+    def _mean(self, x: torch.Tensor, dims) -> torch.Tensor:
+        if self._split():
+            return global_mean(x, dims, self.spatial_ctx)
+        return x.mean(dims, keepdim=True)
+
+    def _std_mean(self, x: torch.Tensor, dims):
+        if self._split():
+            return global_std_mean(x, dims, self.spatial_ctx)
+        return torch.std_mean(x, dims, keepdim=True)
 
     def compute_stats(
         self, x: torch.Tensor, metadata, epsilon: float = 1e-5
@@ -265,7 +284,7 @@ class MeanStdSamplewiseRevNormalization(BaseRevNormalization):
             x = x.float()
             dims = self.get_dims_from_metadata(metadata)
             # Compute samplewise mean and std
-            sample_std, sample_mean = torch.std_mean(x, dims, keepdim=True)
+            sample_std, sample_mean = self._std_mean(x, dims)
             sample_std = torch.maximum(
                 sample_std, torch.tensor(epsilon, device=sample_std.device)
             )
@@ -273,7 +292,7 @@ class MeanStdSamplewiseRevNormalization(BaseRevNormalization):
             # assert x.shape[0] > 1, "Cannot compute delta with only one time frame"
             if x.shape[0] > 1:
                 deltas = x[1:] - x[:-1]  # u_t - u_{t-1}
-                delta_std, delta_mean = torch.std_mean(deltas, dims, keepdim=True)
+                delta_std, delta_mean = self._std_mean(deltas, dims)
                 delta_std = torch.maximum(
                     delta_std, torch.tensor(epsilon, device=delta_std.device)
                 )
@@ -307,7 +326,7 @@ class RMSSamplewiseRevNormalization(MeanStdSamplewiseRevNormalization):
             x = x.float()
             dims = self.get_dims_from_metadata(metadata)
             # Compute samplewise mean and std
-            sample_std = x.square().mean(dims, keepdim=True).sqrt()
+            sample_std = self._mean(x.square(), dims).sqrt()
             sample_mean = torch.zeros_like(sample_std)
             sample_std = torch.maximum(
                 sample_std, torch.tensor(epsilon, device=sample_std.device)
@@ -316,7 +335,7 @@ class RMSSamplewiseRevNormalization(MeanStdSamplewiseRevNormalization):
             # assert x.shape[0] > 1, "Cannot compute delta with only one time frame"
             if x.shape[0] > 1:
                 deltas = x[1:] - x[:-1]  # u_t - u_{t-1}
-                delta_std = deltas.square().mean(dims, keepdim=True).sqrt()
+                delta_std = self._mean(deltas.square(), dims).sqrt()
                 delta_mean = torch.zeros_like(delta_std)
                 delta_std = torch.maximum(
                     delta_std, torch.tensor(epsilon, device=delta_std.device)

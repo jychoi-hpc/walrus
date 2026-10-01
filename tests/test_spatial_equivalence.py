@@ -136,3 +136,73 @@ def test_rms_group_norm_differs_without_split():
 def test_patch_conv_and_norm_stack_is_equivalent():
     assert_spatially_equivalent(patch_conv_then_norm, (2, 4, 40, 8, 8), split_dim=2,
                                 align=4, make_spatial_module=split)
+
+
+# t207: RevIN statistics and the loss across the spatial group
+class RevINNormalize(nn.Module):
+    """What the trainer does to inputs: samplewise statistics (no gradient),
+    then normalized values and normalized time differences, scaled by a
+    parameter so its gradient is checked too. Input: T B C x y z."""
+
+    def __init__(self, kind):
+        from walrus.trainer import normalization_strat as ns
+
+        super().__init__()
+        self.revin = {"rms": ns.RMSSamplewiseRevNormalization,
+                      "meanstd": ns.MeanStdSamplewiseRevNormalization}[kind]()
+        self.scale = nn.Parameter(torch.linspace(0.5, 1.5, 4).view(1, 1, 4, 1, 1, 1))
+        self.spatial_ctx = None  # set by enable_domain_split
+
+    def forward(self, x):
+        from types import SimpleNamespace
+
+        self.revin.spatial_ctx = self.spatial_ctx
+        meta = SimpleNamespace(n_spatial_dims=3)
+        with torch.no_grad():
+            stats = self.revin.compute_stats(x, meta)
+        values = self.revin.normalize_stdmean(x, stats)
+        deltas = self.revin.normalize_delta(x[1:] - x[:-1], stats)
+        return self.scale * torch.cat([values, deltas], dim=0)
+
+
+class MAELoss(nn.Module):
+    """Training loss on (B, T, x, y, z, C) predictions against a target that
+    depends on the prediction pointwise; on slabs, each GPU's share."""
+
+    def __init__(self):
+        super().__init__()
+        self.spatial_ctx = None
+
+    def forward(self, y_pred):
+        from types import SimpleNamespace
+
+        from the_well.benchmark.metrics import MAE
+
+        from walrus.trainer.spatial_reductions import spatial_mean_loss
+
+        meta = SimpleNamespace(n_spatial_dims=3)
+        y_ref = torch.tanh(1.3 * y_pred).detach()
+        if self.spatial_ctx is not None:
+            return spatial_mean_loss(MAE(), y_pred, y_ref, meta, self.spatial_ctx).mean()
+        return MAE()(y_pred, y_ref, meta).mean()
+
+
+REVIN_SHAPE = (3, 2, 4, 40, 4, 4)  # T B C x y z, 3 time steps for delta stats
+
+
+@pytest.mark.parametrize("kind", ["rms", "meanstd"])
+def test_revin_statistics_are_equivalent_when_split(kind):
+    assert_spatially_equivalent(partial(RevINNormalize, kind), REVIN_SHAPE, split_dim=3,
+                                align=4, make_spatial_module=split, atol=1e-5, rtol=1e-5)
+
+
+def test_revin_statistics_differ_without_split():
+    reports = check_spatial_equivalence(partial(RevINNormalize, "rms"), REVIN_SHAPE,
+                                        split_dim=3, align=4, atol=1e-5, rtol=1e-5)
+    assert not all(r["output"][2] for r in reports)
+
+
+def test_loss_shares_add_up_to_full_domain_loss():
+    assert_spatially_equivalent(MAELoss, (2, 1, 40, 4, 4, 3), split_dim=2, align=4,
+                                make_spatial_module=split, out_split_dim=None,
+                                output_is_partial_sum=True)
