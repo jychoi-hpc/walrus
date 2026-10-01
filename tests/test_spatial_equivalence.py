@@ -487,3 +487,22 @@ def _encoder_with_wide_x_kernel(ctx):
 
 def test_encoder_refuses_split_axis_kernel_wider_than_stride():
     assert all(run_on_spatial_group(_encoder_with_wide_x_kernel))
+
+
+# Time attention: attends over time at each point, but its norm pools over space
+class TimeAttention(nn.Module):
+    def __init__(self):
+        from walrus.models.temporal_blocks.axial_time_attention import AxialTimeAttention
+
+        super().__init__()
+        torch.manual_seed(8)
+        self.block = AxialTimeAttention(hidden_dim=16, num_heads=2)
+
+    def forward(self, x):
+        out = self.block(x)
+        return out[0] if isinstance(out, tuple) else out
+
+
+def test_time_attention_is_equivalent_on_slabs():
+    assert_spatially_equivalent(TimeAttention, (3, 2, 16, 12, 4, 4), split_dim=3,
+                                make_spatial_module=split)
