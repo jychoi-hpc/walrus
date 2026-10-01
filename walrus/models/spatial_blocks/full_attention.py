@@ -4,7 +4,6 @@ from typing import Callable
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from timm.layers import DropPath
 from torch.nn import init
 
 # Replace with model path later
@@ -14,6 +13,7 @@ from ..shared_utils.position_biases import (
     RelativePositionBias,
 )
 from ...utils.spatial import SpatialContext, slab_offset_and_total
+from ...utils.spatial_attention import SpatialDropPath, slab_attention
 
 
 class SwiGLU(nn.Module):
@@ -90,7 +90,7 @@ class FullAttention(nn.Module):
             self.rel_pos_biases = nn.ModuleList(
                 [RelativePositionBias(n_heads=num_heads) for _ in range(3)]
             )
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = SpatialDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         # Set by walrus.utils.spatial.enable_domain_split: the input is one slab
         self.spatial_ctx: SpatialContext | None = None
 
@@ -144,10 +144,11 @@ class FullAttention(nn.Module):
             lambda t: rearrange(t, "b he h w d c -> b he (h w d) c"), (q, k, v)
         )
         if self.spatial_ctx is not None and self.spatial_ctx.size > 1:
-            raise NotImplementedError(
-                "attention across slabs is not implemented yet (tracker task t301)"
-            )
-        att = F.scaled_dot_product_attention(q, k, v)
+            # Every token of the domain attends to every other: swap so each
+            # GPU holds all tokens for a share of the heads, attend, swap back
+            att = slab_attention(q, k, v, self.spatial_ctx, F.scaled_dot_product_attention)
+        else:
+            att = F.scaled_dot_product_attention(q, k, v)
         att = rearrange(att, "b he (h w d) c -> b h w d (he c)", h=H, w=W)
         att_out = self.attn_out(att)
         x = self.drop_path(att_out + self.ff_out(self.activation(ff)))

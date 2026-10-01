@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from timm.layers import DropPath
 from torch.nn import init
 
+from ...utils.spatial_attention import SpatialDropPath
 from ..shared_utils.normalization import RMSGroupNorm
 from ..shared_utils.position_biases import (
     RelativePositionBias,
@@ -57,7 +57,7 @@ class AxialTimeAttention(nn.Module):
                 n_heads=num_heads, bidirectional=(not causal_in_time)
             )
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = SpatialDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def get_rotary_embedding(self, n, device):
         # if self.pos_emb is not None and self.pos_emb.shape[-2] >= n:

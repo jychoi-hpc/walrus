@@ -239,20 +239,54 @@ def test_rotary_positions_differ_without_split():
     assert not all(r["output"][2] for r in reports)
 
 
-def _attention_refuses_slabs(ctx):
-    from walrus.models.spatial_blocks.full_attention import FullAttention
-    from walrus.utils.spatial import enable_domain_split
+class SpaceAttention(nn.Module):
+    """FullAttention block (B, C, x, y, z) -> (B, C, x, y, z). With drop_path,
+    the generator is reseeded so the full grid and rank 0 draw the same mask."""
 
-    attention = enable_domain_split(FullAttention(hidden_dim=32, num_heads=2, mlp_dim=64))
+    def __init__(self, heads=4, drop_path=0.0):
+        from walrus.models.spatial_blocks.full_attention import FullAttention
+
+        super().__init__()
+        torch.manual_seed(9)
+        self.block = FullAttention(hidden_dim=64, num_heads=heads, mlp_dim=128,
+                                   drop_path=drop_path)
+
+    def forward(self, x):
+        torch.manual_seed(10)
+        return self.block(x, bcs=None)[0]
+
+
+ATTENTION_SHAPE = (3, 64, 10, 4, 3)  # 10 tokens along x: slabs of 3/3/2/2
+
+
+@pytest.mark.parametrize("world_size", [4, 2])
+def test_full_attention_is_equivalent_on_slabs(world_size):
+    assert_spatially_equivalent(SpaceAttention, ATTENTION_SHAPE, split_dim=2,
+                                make_spatial_module=split, world_size=world_size)
+
+
+def test_full_attention_differs_without_split():
+    reports = check_spatial_equivalence(SpaceAttention, ATTENTION_SHAPE, split_dim=2)
+    assert not all(r["output"][2] for r in reports)
+
+
+def test_drop_path_is_shared_on_slabs():
+    # High drop rate over 3 samples: some are dropped, all slabs must agree
+    assert_spatially_equivalent(partial(SpaceAttention, 4, 0.5), ATTENTION_SHAPE,
+                                split_dim=2, make_spatial_module=split)
+
+
+def _attention_with_too_few_heads(ctx):
+    model = split(SpaceAttention(heads=2))
     try:
-        attention(torch.randn(1, 32, 3, 4, 4), bcs=None)
-    except NotImplementedError:
-        return True
+        model(torch.randn(1, 64, 3, 4, 3))
+    except ValueError as err:
+        return "multiple of the spatial group size" in str(err)
     return False
 
 
-def test_full_attention_refuses_to_run_on_slabs_until_t301():
-    assert all(run_on_spatial_group(_attention_refuses_slabs))
+def test_full_attention_needs_heads_divisible_by_gpus():
+    assert all(run_on_spatial_group(_attention_with_too_few_heads))
 
 
 # t202: halo exchange - a convolution on halo'd slabs equals the full domain
