@@ -303,15 +303,23 @@ class RotaryEmbedding(Module):
 
         return scale
 
-    def get_axial_freqs(self, *dims):
+    def get_axial_freqs(self, *dims, offsets=None, totals=None):
+        """Frequencies for a grid of size dims. For one slab of a larger grid,
+        totals gives each axis's full length and offsets the slab's start, so
+        positions are those of the full grid (pixel positions span [-1, 1]
+        over the full axis)."""
         Colon = slice(None)
         all_freqs = []
+        offsets = offsets or [0] * len(dims)
+        totals = totals or list(dims)
 
         for ind, dim in enumerate(dims):
+            start, total = offsets[ind], totals[ind]
             if self.freqs_for == "pixel":
-                pos = torch.linspace(-1, 1, steps=dim, device=self.device)
+                pos = torch.linspace(-1, 1, steps=total, device=self.device)
+                pos = pos[start : start + dim]
             else:
-                pos = torch.arange(dim, device=self.device)
+                pos = torch.arange(start, start + dim, device=self.device)
 
             freqs = self.forward(pos, seq_len=dim, index=ind)
 

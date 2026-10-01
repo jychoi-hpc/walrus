@@ -138,6 +138,18 @@ def gather_slabs(x_local: torch.Tensor, dim: int, ctx: SpatialContext) -> torch.
     return torch.cat([p.narrow(dim, 0, w) for p, w in zip(parts, widths)], dim=dim)
 
 
+def slab_offset_and_total(n_local: int, ctx: SpatialContext) -> Tuple[int, int]:
+    """Start of this rank's slab along the split axis and the axis's full
+    length, from the local lengths of all slabs of the group."""
+    local = torch.tensor([n_local], dtype=torch.long)
+    if dist.get_backend(ctx.group) == "nccl":
+        local = local.cuda()
+    widths = [torch.empty_like(local) for _ in range(ctx.size)]
+    dist.all_gather(widths, local, group=ctx.group)
+    widths = [int(w) for w in widths]
+    return sum(widths[: ctx.rank]), sum(widths)
+
+
 def enable_domain_split(model: "torch.nn.Module", ctx: Optional[SpatialContext] = None):
     """Mark every layer of `model` that supports it (has a `spatial_ctx`
     attribute) to treat its input as this GPU's slab and communicate over the

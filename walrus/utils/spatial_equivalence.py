@@ -137,7 +137,9 @@ def _compare_param_grads(ctx, reference, spatial, atol, rtol, report):
     for name, p in spatial.named_parameters():
         grad = p.grad.clone() if p.grad is not None else torch.zeros_like(p)
         dist.all_reduce(grad, group=ctx.group)
-        _compare(f"grad {name}", grad, ref_params[name].grad, atol, rtol, report)
+        ref = ref_params[name]
+        ref_grad = ref.grad if ref.grad is not None else torch.zeros_like(ref)
+        _compare(f"grad {name}", grad, ref_grad, atol, rtol, report)
 
 
 def check_spatial_equivalence(

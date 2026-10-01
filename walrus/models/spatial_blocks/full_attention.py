@@ -13,6 +13,7 @@ from ..shared_utils.normalization import RMSGroupNorm
 from ..shared_utils.position_biases import (
     RelativePositionBias,
 )
+from ...utils.spatial import SpatialContext, slab_offset_and_total
 
 
 class SwiGLU(nn.Module):
@@ -90,6 +91,8 @@ class FullAttention(nn.Module):
                 [RelativePositionBias(n_heads=num_heads) for _ in range(3)]
             )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        # Set by walrus.utils.spatial.enable_domain_split: the input is one slab
+        self.spatial_ctx: SpatialContext | None = None
 
     def make_rope_learnable(self, per_axis=False):
         """
@@ -105,6 +108,18 @@ class FullAttention(nn.Module):
         pos_emb = self.rotary_emb(n, device=device)
         # self.register_buffer("pos_emb", pos_emb, persistent=False)
         return pos_emb
+
+    def axial_rotary_freqs(self, H, W, D):
+        """Rotary frequencies for an H x W x D token grid. When the domain is
+        split, the grid is one slab along the split axis: positions are taken
+        from the full grid, offset by the slab's start."""
+        ctx = self.spatial_ctx
+        if ctx is None or ctx.size == 1:
+            return self.rotary_emb.get_axial_freqs(H, W, D)
+        dims = [H, W, D]
+        offsets, totals = [0, 0, 0], list(dims)
+        offsets[ctx.axis], totals[ctx.axis] = slab_offset_and_total(dims[ctx.axis], ctx)
+        return self.rotary_emb.get_axial_freqs(H, W, D, offsets=offsets, totals=totals)
 
     def forward(self, x, bcs, return_att=False):
         # input is t x b x c x h x w
@@ -123,11 +138,15 @@ class FullAttention(nn.Module):
         )
         q = self.q_norm(q)
         k = self.k_norm(k)
-        pos_emb = self.rotary_emb.get_axial_freqs(H, W, D)
+        pos_emb = self.axial_rotary_freqs(H, W, D)
         q, k = map(lambda t: apply_rotary_emb(pos_emb, t), (q, k))
         q, k, v = map(
             lambda t: rearrange(t, "b he h w d c -> b he (h w d) c"), (q, k, v)
         )
+        if self.spatial_ctx is not None and self.spatial_ctx.size > 1:
+            raise NotImplementedError(
+                "attention across slabs is not implemented yet (tracker task t301)"
+            )
         att = F.scaled_dot_product_attention(q, k, v)
         att = rearrange(att, "b he (h w d) c -> b h w d (he c)", h=H, w=W)
         att_out = self.attn_out(att)

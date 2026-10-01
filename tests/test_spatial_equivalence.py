@@ -206,3 +206,50 @@ def test_loss_shares_add_up_to_full_domain_loss():
     assert_spatially_equivalent(MAELoss, (2, 1, 40, 4, 4, 3), split_dim=2, align=4,
                                 make_spatial_module=split, out_split_dim=None,
                                 output_is_partial_sum=True)
+
+
+# t206: rotary positions of a slab are those of the full grid
+class RotaryQK(nn.Module):
+    """FullAttention's rotary embedding applied to queries (B, heads, x, y, z, c)."""
+
+    def __init__(self):
+        from walrus.models.spatial_blocks.full_attention import FullAttention
+
+        super().__init__()
+        torch.manual_seed(2)
+        self.attention = FullAttention(hidden_dim=32, num_heads=2, mlp_dim=64)
+
+    def forward(self, q):
+        from walrus.models.shared_utils.lr_rope_temporary import apply_rotary_emb
+
+        pos = self.attention.axial_rotary_freqs(*q.shape[2:5])
+        return apply_rotary_emb(pos.to(q.dtype), q)
+
+
+ROTARY_SHAPE = (2, 2, 10, 4, 3, 16)  # 10 tokens along x: slabs of 3/3/2/2
+
+
+def test_rotary_positions_are_equivalent_when_split():
+    assert_spatially_equivalent(RotaryQK, ROTARY_SHAPE, split_dim=2,
+                                make_spatial_module=split)
+
+
+def test_rotary_positions_differ_without_split():
+    reports = check_spatial_equivalence(RotaryQK, ROTARY_SHAPE, split_dim=2)
+    assert not all(r["output"][2] for r in reports)
+
+
+def _attention_refuses_slabs(ctx):
+    from walrus.models.spatial_blocks.full_attention import FullAttention
+    from walrus.utils.spatial import enable_domain_split
+
+    attention = enable_domain_split(FullAttention(hidden_dim=32, num_heads=2, mlp_dim=64))
+    try:
+        attention(torch.randn(1, 32, 3, 4, 4), bcs=None)
+    except NotImplementedError:
+        return True
+    return False
+
+
+def test_full_attention_refuses_to_run_on_slabs_until_t301():
+    assert all(run_on_spatial_group(_attention_refuses_slabs))
