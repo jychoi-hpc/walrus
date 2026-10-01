@@ -121,7 +121,24 @@ def choose_kernel_size_deterministic(
         h_patch = H // per_axis_tokens
         w_patch = W // per_axis_tokens
         d_patch = D // per_axis_tokens
-        return (patch_dict[h_patch], patch_dict[w_patch], patch_dict[d_patch])
+        largest_patch = max(patch_dict)  # 32 -> (8, 4)
+
+        def axis_kernel(patch: int, size: int) -> Tuple[int, int]:
+            if patch in patch_dict:
+                return patch_dict[patch]
+            # Axes larger than the table covers (e.g. 1536 -> 96) keep the largest
+            # patch and yield more tokens instead. Encoder kernels are fixed at the
+            # base size and only the stride varies, so a larger stride would skip
+            # grid points.
+            if (
+                non_singleton_D == 3
+                and patch > largest_patch
+                and size % largest_patch == 0
+            ):
+                return patch_dict[largest_patch]
+            raise KeyError(patch)
+
+        return (axis_kernel(h_patch, H), axis_kernel(w_patch, W), axis_kernel(d_patch, D))
     else:
         raise ValueError("Image size must be 1, 2 or 3 dimensions")
 
