@@ -95,6 +95,15 @@ enough to completely eliminate discrepencies, so we must also adjust our samplin
 We implement sampling such that when training with HSDP, all nodes within a sharding group are forced to sample the same data source. This
 balances batch diversity and efficiency. 
 
+### Large grids: spatial parallelism
+
+For grids too large for one GPU, `distribution=spatial distribution.split_domain=true`
+splits each sample into slabs across the GPUs of a group (domain decomposition)
+and trains on the full grid without cropping or downsampling; data parallelism
+runs across groups. Results match single-GPU training. See
+[walrus/configs/distribution/README.md](walrus/configs/distribution/README.md)
+for settings, requirements and limits.
+
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
