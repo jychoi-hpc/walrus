@@ -121,12 +121,19 @@ def distribute_model(model, cfg, mesh=None):
     elif cfg.distribution.distribution_type.upper() in ["FSDP", "HSDP", "DDP", "SPATIAL"]:
         # FSDP and HSDP both use FSDP API, so need to build in AMP if we're going to use it.
         if cfg.trainer.enable_amp:
+            # Same 16-bit type as the trainer's autocast: bfloat16 has float32's
+            # range (float16 overflows above 65504)
+            half = (
+                torch.bfloat16
+                if cfg.trainer.get("amp_type", "float16") == "bfloat16"
+                else torch.float16
+            )
             fpSixteen = MixedPrecision(
-                param_dtype=torch.float16,
+                param_dtype=half,
                 # Gradient communication precision.
-                reduce_dtype=torch.float16,
+                reduce_dtype=half,
                 # Buffer precision.
-                buffer_dtype=torch.float16,
+                buffer_dtype=half,
             )
         else:
             fpSixteen = None
