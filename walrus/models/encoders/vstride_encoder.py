@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
+from walrus.models.shared_utils.large_conv import chunked_conv
 from walrus.utils.spatial import check_patch_aligned
 
 CONV_FUNCS = {
@@ -250,7 +251,8 @@ class AdaptiveDVstrideEncoder(nn.Module):
                 weight = weight.sum(dim=-i, keepdim=True)
                 stride[-i] = 1
                 padding[-i] = 0
-        out = self.conv_func(x, weight, bias, tuple(stride), tuple(padding))
+        # In chunks when the tensors exceed 2^31 elements (slow kernels otherwise)
+        out = chunked_conv(self.conv_func, x, weight, bias, stride, padding)
         return out
 
     def forward(

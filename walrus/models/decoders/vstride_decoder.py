@@ -9,6 +9,7 @@ from einops import rearrange
 from the_well.data.datasets import BoundaryCondition
 from torch import Tensor
 
+from walrus.models.shared_utils.large_conv import chunked_conv
 from walrus.utils.spatial import check_patch_aligned
 
 CONV_FUNCS = {
@@ -249,7 +250,8 @@ class AdaptiveDVstrideDecoder(nn.Module):
         x = F.pad(x, pad=tuple(periodic_padding), mode="circular")
         # if dist.get_rank() == 0:
         #     print(dist.get_rank(), "post per pad", x.shape)
-        x = self.conv_func(x, weight, bias, tuple(stride), tuple(padding))
+        # In chunks when the tensors exceed 2^31 elements (slow kernels otherwise)
+        x = chunked_conv(self.conv_func, x, weight, bias, stride, padding, transpose=True)
         # if dist.get_rank() == 0:
         #     print(dist.get_rank(), "pre out pad", x.shape)
         x = F.pad(x, pad=padding_out, mode="constant")
