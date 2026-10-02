@@ -631,3 +631,25 @@ def _metrics_on_slabs(ctx):
 def test_validation_metrics_on_slabs_equal_full_domain():
     for worst in run_on_spatial_group(_metrics_on_slabs):
         assert all(err < 1e-12 for err in worst.values()), worst
+
+
+def _norm_under_autocast(ctx):
+    """Split RMSGroupNorm under autocast must compute like F.rms_norm there."""
+    from walrus.models.shared_utils.normalization import spatial_rms_norm
+
+    torch.manual_seed(31)
+    x = torch.randn(2, 2, 3, 40, 6, 6).to(torch.bfloat16) * 1e-2  # B G C/G x y z
+    start, stop = 10 * ctx.rank, 10 * (ctx.rank + 1)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        full = torch.nn.functional.rms_norm(x, x.shape[3:])
+        mine = spatial_rms_norm(x[:, :, :, start:stop], ctx)
+    want = full[:, :, :, start:stop]
+    rel = float((mine.float() - want.float()).abs().max() / want.float().abs().max())
+    return mine.dtype == want.dtype, rel
+
+
+def test_rms_group_norm_matches_autocast_dtype():
+    # Small values (1e-2): a wrong eps (the input type's, 8e-3 for bfloat16)
+    # changes the result by order 1; bfloat16 rounding is below 1e-2
+    for same_dtype, rel in run_on_spatial_group(_norm_under_autocast):
+        assert same_dtype and rel < 1e-2, (same_dtype, rel)

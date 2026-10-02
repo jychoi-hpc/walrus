@@ -21,7 +21,13 @@ def spatial_rms_norm(x: torch.Tensor, ctx: SpatialContext) -> torch.Tensor:
     group, *space) that is the RMS of each channel over space - when space is
     split into slabs over ctx.group: the sum of squares and the point count are
     summed over the group, so every slab is scaled by the RMS of the whole
-    domain. Uses F.rms_norm's default eps (finfo(dtype).eps)."""
+    domain. Like F.rms_norm, sums in at least float32 with that type's eps,
+    and computes in float32 under autocast."""
+    # Compute in the dtype F.rms_norm would use here: under autocast it
+    # upcasts half-precision inputs to float32 (with float32's eps)
+    compute_dtype = F.rms_norm(x.new_zeros(1, 1), (1,)).dtype
+    if compute_dtype != x.dtype:
+        x = x.to(compute_dtype)
     reduce_dims = tuple(range(3, x.dim()))
     # Accumulate in at least float32 (half-precision inputs under AMP)
     acc_dtype = torch.promote_types(x.dtype, torch.float32)
@@ -29,7 +35,8 @@ def spatial_rms_norm(x: torch.Tensor, ctx: SpatialContext) -> torch.Tensor:
     sum_sq = all_reduce(sum_sq, group=ctx.group)  # differentiable
     count = torch.tensor(float(math.prod(x.shape[3:])), device=x.device)
     torch.distributed.all_reduce(count, group=ctx.group)
-    inv_rms = torch.rsqrt(sum_sq / count + torch.finfo(x.dtype).eps)
+    # F.rms_norm works in float32 (at least) and uses that type's eps
+    inv_rms = torch.rsqrt(sum_sq / count + torch.finfo(acc_dtype).eps)
     return x * inv_rms.to(x.dtype).view(*inv_rms.shape, *([1] * len(reduce_dims)))
 
 
