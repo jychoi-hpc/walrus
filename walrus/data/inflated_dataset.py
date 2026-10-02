@@ -1,6 +1,7 @@
 import dataclasses
 import itertools
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, cast
 
 import torch
@@ -15,6 +16,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CARTESIAN_DIMS = ["x", "y", "z"]
+
+
+def _add_batch_dim(item):
+    if isinstance(item, torch.Tensor):
+        return item.unsqueeze(0)
+    if isinstance(item, Mapping):
+        return type(item)({k: _add_batch_dim(v) for k, v in item.items()})
+    return default_collate([item])
+
+
+def collate_samples(samples: List):
+    """default_collate, except that a batch of one sample gets its batch
+    dimension added as a view instead of stacked into an identical copy
+    (at large grids a sample is several GB)."""
+    if len(samples) == 1:
+        return _add_batch_dim(samples[0])
+    return default_collate(samples)
 
 
 class InflatedWellDataset(WellDataset):
@@ -180,6 +198,8 @@ class InflatedWellDataset(WellDataset):
         """Pad tensor fields to higher dimensions by adding extra 0 value tensor entries"""
         # Pad fields
         pad_d = d - self.original_metadata.n_spatial_dims
+        if pad_d == 0 or tensor_order == 0:
+            return data_tensor  # nothing to pad: skip F.pad's identical copy
         # These are zeros so just use built-in pad
         data_tensor = torch.nn.functional.pad(
             data_tensor,
@@ -321,7 +341,7 @@ class BatchInflatedWellDataset(InflatedWellDataset):
             sample_idxes.append(sample_idx)
             time_idxes.append(time_idx)
             dts.append(dt)
-        data = default_collate(
+        data = collate_samples(
             data
         )  # {k: torch.stack([d[k] for d in data]) for k in data[0]}
         data = cast(TrajectoryData, data)

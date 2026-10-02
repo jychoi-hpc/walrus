@@ -126,3 +126,33 @@ def test_jitter_is_bit_identical(bc_names, rolls, shape):
         outs.append((y.detach(), x.grad))
     assert outs[0][0].shape == outs[1][0].shape
     assert torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1])
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_batch_loading_is_bit_identical(dummy_dataset, batch_size, monkeypatch):
+    """Host-side trims (no identity tile of freshly read fields, no zero-width
+    padding, unsqueeze instead of stack for one sample) give the same batch."""
+    import walrus.data.inflated_dataset as inflated
+    from the_well.data.datasets import WellDataset
+
+    from walrus.data.multidatamodule import MixedWellDataModule
+
+    def batch():
+        module = MixedWellDataModule(
+            well_base_path=dummy_dataset,
+            well_dataset_info={"dummy": {"path": dummy_dataset / "dummy",
+                                         "include_filters": [], "exclude_filters": []}},
+            batch_size=batch_size, data_workers=0)
+        dset = module.train_dataset.sub_dsets[0]
+        return dset[list(range(batch_size))]
+
+    new = batch()
+    pad_axes = WellDataset._pad_axes
+    monkeypatch.setattr(inflated, "collate_samples", inflated.default_collate)
+    monkeypatch.setattr(WellDataset, "_pad_axes",
+                        lambda self, *a, **k: pad_axes(self, *a, **{**k, "copy": True}))
+    old = batch()
+    assert new.keys() == old.keys()
+    for key in new:
+        if torch.is_tensor(new[key]):
+            assert new[key].shape == old[key].shape and torch.equal(new[key], old[key]), key
