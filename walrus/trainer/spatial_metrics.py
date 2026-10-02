@@ -53,7 +53,17 @@ def _nmse(x, y, dims, ctx, eps, norm_mode):
 def spatial_metric(metric, x: torch.Tensor, y: torch.Tensor, meta, ctx: SpatialContext,
                    eps: float = 1e-7) -> torch.Tensor:
     """metric(x, y, meta, eps=eps) of the_well over the whole split domain,
-    for x, y holding this GPU's slab, (..., *space, C)."""
+    for x, y holding this GPU's slab, (B, T, *space, C). Computed one time
+    step at a time: metrics reduce over space only, so the values are the
+    same, and the temporaries (e.g. (x - y)^2) are one step in size instead
+    of a whole rollout."""
+    if x.dim() == meta.n_spatial_dims + 3 and x.shape[1] > 1:
+        return torch.stack([_spatial_metric(metric, x[:, t:t + 1], y[:, t:t + 1], meta, ctx, eps)
+                            for t in range(x.shape[1])], dim=1).squeeze(2)
+    return _spatial_metric(metric, x, y, meta, ctx, eps)
+
+
+def _spatial_metric(metric, x, y, meta, ctx, eps):
     dims = _dims(x, meta)
     kind = type(metric) if not isinstance(metric, type) else metric
     if kind is MSE:

@@ -732,6 +732,10 @@ class Trainer:
                 dtype=self.amp_type,
             ):
                 for j, batch in enumerate(dataloader):
+                    # Free the previous batch's prediction and target before
+                    # the next rollout instead of after it (at large grids
+                    # they are many GB); the last ones remain for the plots
+                    y_pred = y_ref = y_pred_internal = y_ref_internal = None
                     # Validation datasets don't automatically add metadata
                     start_time = time.time()
                     # Rollout for length of target - fake pass if not evaluating on this node

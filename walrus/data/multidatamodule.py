@@ -77,6 +77,7 @@ class MixedWellDataModule:
         allow_sharding_in_train: bool = False,
         prefetch_factor: Optional[int] = None,
         pin_memory: bool = True,
+        eval_data_workers: Optional[int] = None,
         transform: Optional[
             Union[
                 Augmentation,
@@ -171,12 +172,16 @@ class MixedWellDataModule:
             Whether to allow sharding in the training set. If True and dataset size ~ replication size,
             drop indices can result in large percentage of data dropped.
         prefetch_factor:
-            Training batches each loader worker prepares ahead (None: PyTorch's
+            Batches each loader worker prepares ahead (None: PyTorch's
             default of 2). Each is a full batch in host memory, so at large
             grids a lower value lets more workers fit.
         pin_memory:
-            Copy training batches to pinned host memory for faster transfers to
-            the GPU (one more host copy of each batch).
+            Copy batches to pinned host memory for faster transfers to the GPU
+            (one more host copy of each batch).
+        eval_data_workers:
+            Loader workers for validation and test (None: data_workers).
+            Rollout validation loads whole trajectories, so at large grids
+            fewer workers keep host memory in bounds.
         transform:
             Transformations to apply to the data.
         storage_kwargs:
@@ -258,6 +263,7 @@ class MixedWellDataModule:
         self.allow_sharding_in_train = allow_sharding_in_train
         self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
+        self.eval_data_workers = data_workers if eval_data_workers is None else eval_data_workers
         # Train is a single mixed dataset
         self.train_dataset = MixedWellDataset(
             well_base_path=well_base_path,
@@ -499,8 +505,11 @@ class MixedWellDataModule:
             dataloaders.append(
                 DataLoader(
                     dataset,
-                    num_workers=self.data_workers,
-                    pin_memory=True,
+                    num_workers=self.eval_data_workers,
+                    pin_memory=self.pin_memory,
+                    prefetch_factor=(
+                        self.prefetch_factor if self.eval_data_workers > 0 else None
+                    ),
                     batch_size=None,
                     shuffle=None,  # Sampler is set
                     sampler=sampler,
