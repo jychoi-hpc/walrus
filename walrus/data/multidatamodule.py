@@ -75,6 +75,8 @@ class MixedWellDataModule:
         restrict_train_num_samples: Optional[float | int] = None,
         restriction_seed: int = 0,
         allow_sharding_in_train: bool = False,
+        prefetch_factor: Optional[int] = None,
+        pin_memory: bool = True,
         transform: Optional[
             Union[
                 Augmentation,
@@ -168,6 +170,13 @@ class MixedWellDataModule:
         allow_sharding_in_train:
             Whether to allow sharding in the training set. If True and dataset size ~ replication size,
             drop indices can result in large percentage of data dropped.
+        prefetch_factor:
+            Training batches each loader worker prepares ahead (None: PyTorch's
+            default of 2). Each is a full batch in host memory, so at large
+            grids a lower value lets more workers fit.
+        pin_memory:
+            Copy training batches to pinned host memory for faster transfers to
+            the GPU (one more host copy of each batch).
         transform:
             Transformations to apply to the data.
         storage_kwargs:
@@ -247,6 +256,8 @@ class MixedWellDataModule:
                 f"Expected dataset_kws keys {dataset_kws.keys()} to be a subset of train, val, rollout_val, test, rollout_test."
             )
         self.allow_sharding_in_train = allow_sharding_in_train
+        self.prefetch_factor = prefetch_factor
+        self.pin_memory = pin_memory
         # Train is a single mixed dataset
         self.train_dataset = MixedWellDataset(
             well_base_path=well_base_path,
@@ -447,7 +458,10 @@ class MixedWellDataModule:
         return DataLoader(
             self.train_dataset,
             num_workers=self.data_workers,
-            pin_memory=True,
+            pin_memory=self.pin_memory,
+            # Batches each worker prepares ahead (PyTorch default 2). Every one
+            # is a full batch in host memory, which limits workers at large grids.
+            prefetch_factor=self.prefetch_factor if self.data_workers > 0 else None,
             batch_size=None,
             shuffle=shuffle,
             # drop_last=True,
