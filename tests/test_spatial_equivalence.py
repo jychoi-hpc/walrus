@@ -598,3 +598,36 @@ MODEL_SHAPE = (2, 1, 4, 512, 16, 64)
 def test_walrus_model_is_equivalent_on_slabs(jitter):
     assert_spatially_equivalent(partial(WalrusModel, jitter), MODEL_SHAPE, split_dim=3,
                                 align=32, make_spatial_module=split, atol=1e-9, rtol=1e-7)
+
+
+# t303b: validation metrics over a split domain
+METRIC_NAMES = ["MSE", "MAE", "NMAE", "NMSE", "RMSE", "NRMSE", "VMSE", "VRMSE", "LInfinity",
+                "PearsonR"]
+
+
+def _metrics_on_slabs(ctx):
+    from types import SimpleNamespace
+
+    import the_well.benchmark.metrics as m
+
+    from walrus.trainer.spatial_metrics import spatial_metric
+    from walrus.utils.spatial import slab_bounds
+
+    gen = torch.Generator().manual_seed(21)
+    shape = (2, 3, 40, 6, 5, 4)  # B T x y z C; x slabs of 12/12/8/8
+    y = torch.randn(shape, generator=gen, dtype=torch.float64) * 2 + 0.5
+    x = y + 0.3 * torch.randn(shape, generator=gen, dtype=torch.float64)
+    meta = SimpleNamespace(n_spatial_dims=3)
+    start, stop = slab_bounds(40, ctx.size, ctx.rank, 4)
+    worst = {}
+    for name in METRIC_NAMES:
+        metric = getattr(m, name)()
+        full = metric(x, y, meta, eps=1e-7)
+        split_value = spatial_metric(metric, x[:, :, start:stop], y[:, :, start:stop], meta, ctx)
+        worst[name] = float((split_value - full).abs().max() / full.abs().max())
+    return worst
+
+
+def test_validation_metrics_on_slabs_equal_full_domain():
+    for worst in run_on_spatial_group(_metrics_on_slabs):
+        assert all(err < 1e-12 for err in worst.values()), worst

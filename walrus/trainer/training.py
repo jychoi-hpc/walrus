@@ -32,6 +32,7 @@ from walrus.trainer.normalization_strat import (
     BaseRevNormalization,
     normalize_target,
 )
+from walrus.trainer.spatial_metrics import spatial_metric
 from walrus.trainer.spatial_reductions import spatial_mean_loss
 from walrus.utils.spatial import get_spatial_context
 
@@ -675,6 +676,12 @@ class Trainer:
         significantly varying sizes will probably result in a timeout at one of these barriers.
         """
         full = full if not self.debug_mode else False
+        if self.split_domain:
+            logger.warning(
+                f"{valid_or_test}: domain split across GPUs - metrics are computed over the "
+                "whole domain; spectral metrics, videos, images and prediction dumps are "
+                "skipped (each GPU holds only its slab)"
+            )
         self.model.eval()
         validation_loss = 0.0
         metadatas = []
@@ -778,14 +785,19 @@ class Trainer:
                     for loss_fn in self.validation_suite:
                         # Mean over batch and time per field
                         if (
-                            self.skip_spectral_metrics
-                            and "spectr" in loss_fn.__class__.__name__
-                        ):
+                            self.skip_spectral_metrics or self.split_domain
+                        ) and "spectr" in loss_fn.__class__.__name__:
                             continue
                         # Loss fn expect B T [H W D] C where [H W D] are described by metadata
-                        loss = loss_fn(
-                            y_pred, y_ref, current_metadata, eps=self.validation_epsilon
-                        )
+                        if self.split_domain:  # whole-domain value from every slab
+                            loss = spatial_metric(
+                                loss_fn, y_pred, y_ref, current_metadata,
+                                self.split_ctx, eps=self.validation_epsilon,
+                            )
+                        else:
+                            loss = loss_fn(
+                                y_pred, y_ref, current_metadata, eps=self.validation_epsilon
+                            )
                         # Some losses return multiple values for efficiency, so if not dict,
                         # wrap in dict here
                         if not isinstance(loss, dict):
@@ -822,6 +834,10 @@ class Trainer:
                                         dset_time_logs[loss_name] = batch_time_logs
                     # NOW do trajectory losses if we have them - can probably combine with above later
                     if dataset.full_trajectory_mode:
+                        if self.split_domain and self.validation_trajectory_metrics:
+                            raise NotImplementedError(
+                                "trajectory metrics on a split domain"
+                            )
                         for traj_loss_fn in self.validation_trajectory_metrics or []:
                             traj_loss = traj_loss_fn(
                                 y_pred, y_ref, current_metadata, batch["metadata"]
@@ -851,9 +867,11 @@ class Trainer:
                     if torch.cuda.is_available():
                         torch.cuda.reset_peak_memory_stats()
                     count += 1
-                    # Do some detailed outputs on rank 0 if specified
+                    # Do some detailed outputs on rank 0 if specified (not on a
+                    # split domain: rank 0 holds only its slab)
                     if (
                         self.rank_in_sync_group == 0
+                        and not self.split_domain
                         and rank_assignment == self.sync_group_rank
                     ):
                         if dataset.full_trajectory_mode:
@@ -905,7 +923,7 @@ class Trainer:
                     self.rank_in_sync_group == 0
                     and rank_assignment == self.sync_group_rank
                 ):
-                    if self.image_validation:
+                    if self.image_validation and not self.split_domain:
                         for plot_fn in validation_plots:
                             if (
                                 self.skip_spectral_metrics
@@ -1243,12 +1261,6 @@ class Trainer:
         """
         is_test = valid_or_test == "test"  # Check if test
         val_loss, rollout_val_loss = None, None
-        if self.split_domain:
-            logger.warning(
-                f"Epoch {epoch}/{self.max_epoch}: {valid_or_test} validation skipped: "
-                "metrics on a split domain are not implemented yet (tracker task t303b)"
-            )
-            return val_loss, rollout_val_loss
         # First do one step checks = frequency, last epoch, or test. Only do full validation on last epoch or test
         if epoch % self.val_frequency == 0 or epoch >= self.max_epoch or is_test:
             logger.info(
