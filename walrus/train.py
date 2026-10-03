@@ -103,6 +103,23 @@ def train(
     split_domain = spatial is not None and cfg.distribution.get("split_domain", False)
     if split_domain:
         assign_slabs(datamodule, spatial)  # each GPU reads only its slab
+    ddstore_cfg = cfg.get("ddstore", None)
+    if ddstore_cfg is not None and ddstore_cfg.get("enabled", False):
+        from walrus.data.ddstore_source import DDStoreFieldSource
+
+        # Processes reading the same slab share one store (all of them when
+        # the domain is not split); each holds part of the training data.
+        train_sets = list(getattr(datamodule.train_dataset, "sub_dsets",
+                                  [datamodule.train_dataset]))
+        source = DDStoreFieldSource(
+            train_sets,
+            group_color=spatial.rank if split_domain else 0,
+            group_key=spatial.dp_rank if split_domain else rank,
+            max_row_mb=ddstore_cfg.get("max_row_mb", 512),
+        )
+        for dataset in train_sets:
+            dataset.field_source = source
+        datamodule.train_thread_prefetch = int(ddstore_cfg.get("prefetch", 1))
     field_to_index_map = datamodule.train_dataset.field_to_index_map
     # Retrieve the number of fields used in training
     # from the mapping of field to index and incrementing by 1

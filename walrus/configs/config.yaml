@@ -14,5 +14,9 @@ defaults:
 data_workers: 14
 name: default_name
 seed: # Optional: seed torch and numpy before building data and model (reproducible runs)
+ddstore: # Serve training fields from DDStore (nodes' host memory over libfabric RDMA) instead of the files
+  enabled: false
+  max_row_mb: 512 # rows of one RDMA read; must stay under 2 GB on Perlmutter's cxi network
+  prefetch: 1 # training batches a background thread fetches ahead (training loader runs without workers)
 finetune: False
 automatic_setup: True
