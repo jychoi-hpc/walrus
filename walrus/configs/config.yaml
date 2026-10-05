@@ -17,6 +17,8 @@ seed: # Optional: seed torch and numpy before building data and model (reproduci
 ddstore: # Serve training fields from DDStore (nodes' host memory over libfabric RDMA) instead of the files
   enabled: false
   max_row_mb: 512 # rows of one RDMA read; must stay under 2 GB on Perlmutter's cxi network
-  prefetch: 1 # training batches a background thread fetches ahead (training loader runs without workers)
+  workers: 2 # threads running the training loader (ThreadDataLoader; no forked workers with DDStore)
+  prefetch: 2 # training batches fetched ahead (at least workers); each is a full batch in host memory
+  reuse_buffers: true # each loader thread reads into its own buffer, registered with the network once
 finetune: False
 automatic_setup: True

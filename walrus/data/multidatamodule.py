@@ -21,7 +21,7 @@ from walrus.data.inflated_dataset import (
 from walrus.utils.spatial import get_spatial_context
 
 from .mixed_dset_sampler import BatchedMultisetSampler
-from .prefetch import ThreadPrefetchLoader
+from .thread_loader import ThreadDataLoader
 from .multidataset import MixedWellDataset
 from .utils import get_dict_depth
 
@@ -265,9 +265,14 @@ class MixedWellDataModule:
         self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
         self.eval_data_workers = data_workers if eval_data_workers is None else eval_data_workers
-        # > 0: the training loader runs without workers and a background thread
-        # fetches this many batches ahead (set when fields come from DDStore)
+        # > 0: the training loader runs __getitem__ in this many threads
+        # instead of forked workers (set when fields come from DDStore, whose
+        # reads cannot run in forked workers), train_thread_prefetch batches ahead
+        self.train_threads = 0
         self.train_thread_prefetch = 0
+        # True: validation/test loaders run their eval_data_workers in threads
+        # too (forked workers after MPI/DDStore initialization can hang)
+        self.eval_in_threads = False
         # Train is a single mixed dataset
         self.train_dataset = MixedWellDataset(
             well_base_path=well_base_path,
@@ -464,25 +469,31 @@ class MixedWellDataModule:
         )
 
         shuffle = sampler is None
-        workers = 0 if self.train_thread_prefetch > 0 else self.data_workers
 
-        loader = DataLoader(
+        if self.train_threads > 0:
+            return ThreadDataLoader(
+                self.train_dataset,
+                num_workers=self.train_threads,
+                prefetch=self.train_thread_prefetch,
+                pin_memory=self.pin_memory,
+                batch_size=None,
+                shuffle=shuffle,
+                sampler=sampler,
+                collate_fn=None,
+            )
+        return DataLoader(
             self.train_dataset,
-            num_workers=workers,
+            num_workers=self.data_workers,
             pin_memory=self.pin_memory,
             # Batches each worker prepares ahead (PyTorch default 2). Every one
             # is a full batch in host memory, which limits workers at large grids.
-            prefetch_factor=self.prefetch_factor if workers > 0 else None,
+            prefetch_factor=self.prefetch_factor if self.data_workers > 0 else None,
             batch_size=None,
             shuffle=shuffle,
             # drop_last=True,
             sampler=sampler,
             collate_fn=None,
         )
-        if self.train_thread_prefetch > 0:
-            # DDStore reads cannot run in forked workers; a thread fetches ahead
-            return ThreadPrefetchLoader(loader, self.train_thread_prefetch)
-        return loader
 
     def build_loaders_from_dset_list(
         self, dset_list, batch_size=1, replicas=None, rank=None, full=True
@@ -511,6 +522,20 @@ class MixedWellDataModule:
                     drop_last=False,
                 )
 
+            if self.eval_in_threads and self.eval_data_workers > 0:
+                # Same workers and read-ahead as the forked loader below
+                dataloaders.append(
+                    ThreadDataLoader(
+                        dataset,
+                        num_workers=self.eval_data_workers,
+                        prefetch=self.eval_data_workers * (self.prefetch_factor or 2),
+                        pin_memory=self.pin_memory,
+                        batch_size=None,
+                        sampler=sampler,
+                        collate_fn=None,
+                    )
+                )
+                continue
             dataloaders.append(
                 DataLoader(
                     dataset,

@@ -116,10 +116,16 @@ def train(
             group_color=spatial.rank if split_domain else 0,
             group_key=spatial.dp_rank if split_domain else rank,
             max_row_mb=ddstore_cfg.get("max_row_mb", 512),
+            # One registered read buffer per loader thread
+            reuse_slots=int(ddstore_cfg.get("workers", 2))
+            if ddstore_cfg.get("reuse_buffers", True) else 0,
         )
         for dataset in train_sets:
             dataset.field_source = source
-        datamodule.train_thread_prefetch = int(ddstore_cfg.get("prefetch", 1))
+        datamodule.train_threads = int(ddstore_cfg.get("workers", 2))
+        datamodule.train_thread_prefetch = int(ddstore_cfg.get("prefetch", 2))
+        # No forked loader workers once MPI and DDStore are running
+        datamodule.eval_in_threads = True
     field_to_index_map = datamodule.train_dataset.field_to_index_map
     # Retrieve the number of fields used in training
     # from the mapping of field to index and incrementing by 1

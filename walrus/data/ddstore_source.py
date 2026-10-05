@@ -11,12 +11,24 @@ is stored as rows of `planes` points along the slab axis, at most
 network).
 
 Only DDStore method 1 (libfabric) is used; set DDSTORE_FABRIC=cxi on
-Perlmutter. Reads run without the GIL, so a background thread can fetch the
-next sample while the training step runs (see walrus.data.prefetch).
+Perlmutter. Reads run without the GIL, so loader threads fetch upcoming
+samples while the training step runs (see walrus.data.thread_loader).
+
+Reading (DDStore >= 3.0, which has get_batch() and locks each variable
+itself): one get_batch() per field and sample. With reuse_slots > 0, each
+loader thread reads into its own slot of a buffer pool per field, and the
+whole pool is registered with the network card once; fresh buffers would be
+registered (pinned) again on every read, which costs more than the transfer.
+A returned array is then a view of the thread's slot, valid until that
+thread's next read: the_well copies the fields (concatenation) before
+__getitem__ returns. Older DDStore builds: one get() per row, under a lock.
 """
 
+import contextlib
+import itertools
 import logging
 import os
+import threading
 import time
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -55,7 +67,7 @@ class DDStoreFieldSource:
     """Field source for the_well's WellDataset (its `field_source` attribute)."""
 
     def __init__(self, datasets: Iterable, group_color: int, group_key: int,
-                 max_row_mb: float = 512.0):
+                 max_row_mb: float = 512.0, reuse_slots: int = 0):
         import torch  # noqa: F401  (torch must load before mpi4py initializes MPI)
         import mpi4py
 
@@ -69,6 +81,14 @@ class DDStoreFieldSource:
         self.comm = MPI.COMM_WORLD.Split(group_color, group_key)
         g_rank, g_size = self.comm.Get_rank(), self.comm.Get_size()
         self.store = dds.PyDDStore(self.comm, method=1)
+        self.batched = hasattr(self.store, "get_batch")
+        # DDStore >= 3.0 serializes reads of one variable itself
+        self._lock = contextlib.nullcontext() if self.batched else threading.Lock()
+        self.reuse_slots = int(reuse_slots) if self.batched else 0
+        self._pools: Dict[Tuple[str, int], np.ndarray] = {}
+        self._pools_lock = threading.Lock()
+        self._thread = threading.local()
+        self._slot_ids = itertools.count()
         self.variables: Dict[Tuple[str, str, Optional[tuple]], _Variable] = {}
         self._files = []
         t0, loaded = time.perf_counter(), 0
@@ -125,15 +145,58 @@ class DDStoreFieldSource:
                     self.variables[(path, key, slab)] = var
         return loaded
 
+    def _slot(self) -> Optional[int]:
+        """This thread's pool slot; None when every slot is taken."""
+        slot = getattr(self._thread, "slot", None)
+        if slot is None:
+            with self._pools_lock:
+                slot = next(self._slot_ids)
+            self._thread.slot = slot
+        return slot if slot < self.reuse_slots else None
+
+    def _pool(self, var: _Variable, n_rows: int) -> np.ndarray:
+        """reuse_slots x n_rows rows for `var`, registered once: a first
+        get_batch() over the whole pool (row 0 repeated) registers it, and
+        later reads into any slot fall inside that registration."""
+        key = (var.name, n_rows)
+        with self._pools_lock:
+            pool = self._pools.get(key)
+            if pool is None:
+                pool = np.empty((self.reuse_slots, n_rows, var.disp), dtype=np.float32)
+                self.store.get_batch(var.name, pool.reshape(-1, var.disp),
+                                     [0] * (self.reuse_slots * n_rows))
+                self._pools[key] = pool
+        return pool
+
+    def _get_rows(self, var: _Variable, dst: np.ndarray, rows) -> None:
+        if self.batched:
+            self.store.get_batch(var.name, dst, rows)
+        else:
+            for i, r in enumerate(rows):
+                with self._lock:
+                    self.store.get(var.name, dst[i:i + 1], start=r)
+
     def read(self, path, field_key, sample_idx, time_idx, n_steps, dt, slab):
         """Fields of steps time_idx, time_idx + dt, ... (n_steps of them) for
         this slab, shaped as the HDF5 read would return them; None when the
-        field is not held."""
+        field is not held. With reuse_slots, a view of this thread's slot."""
         var = self.variables.get((path, field_key, slab))
         if var is None:
             return None
-        out = np.empty((n_steps,) + var.slab_shape + ((var.components,) if var.components > 1 else ()),
-                       dtype=np.float32)
+        shape = (n_steps,) + var.slab_shape + ((var.components,) if var.components > 1 else ())
+        if var.axis == 0:
+            # Chunks along the first axis: the rows of all steps, in order,
+            # are exactly the output array
+            rows = [var.row(sample_idx, time_idx + k * dt, c)
+                    for k in range(n_steps) for c in range(var.chunks)]
+            slot = self._slot() if self.reuse_slots else None
+            if slot is not None:
+                dst = self._pool(var, len(rows))[slot]
+            else:
+                dst = np.empty((len(rows), var.disp), dtype=np.float32)
+            self._get_rows(var, dst, rows)
+            return dst.reshape(shape)
+        out = np.empty(shape, dtype=np.float32)
         for k in range(n_steps):
             step = time_idx + k * dt
             for c in range(var.chunks):
@@ -141,10 +204,12 @@ class DDStoreFieldSource:
                 index[var.axis] = slice(c * var.planes, (c + 1) * var.planes)
                 dst = out[(k, *index)]
                 if dst.flags.c_contiguous:
-                    self.store.get(var.name, dst.reshape(1, -1), start=var.row(sample_idx, step, c))
+                    with self._lock:
+                        self.store.get(var.name, dst.reshape(1, -1), start=var.row(sample_idx, step, c))
                 else:
                     buf = np.empty((1, var.disp), np.float32)
-                    self.store.get(var.name, buf, start=var.row(sample_idx, step, c))
+                    with self._lock:
+                        self.store.get(var.name, buf, start=var.row(sample_idx, step, c))
                     dst[...] = buf.reshape(var.chunk_shape)
         return out
 
