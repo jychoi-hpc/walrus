@@ -1,6 +1,8 @@
-"""ThreadDataLoader (walrus.data.thread_loader): same batches in the same order
-as torch's DataLoader, at most `ahead` batches fetched ahead of the consumer,
-and dataset errors raised in the training loop."""
+"""DDStore's ThreadDataLoader (pyddstore.torch), as Walrus uses it with DDStore:
+same batches in the same order as torch's DataLoader (also with batch_size=None
+and samplers that yield whole batches), the same global random draws, at most
+num_workers * prefetch_factor batches fetched ahead, a new epoch after an early
+exit, and dataset errors raised in the training loop."""
 
 import threading
 import time
@@ -9,7 +11,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from walrus.data.thread_loader import ThreadDataLoader
+ThreadDataLoader = pytest.importorskip("pyddstore.torch").ThreadDataLoader
 
 
 class Squares(Dataset):
@@ -74,13 +76,15 @@ def test_auto_collation_matches_dataloader():
 
 def test_fetches_at_most_ahead_batches():
     ds = Squares(n=30, delay=0.001)
-    loader = ThreadDataLoader(ds, num_workers=2, prefetch=3, batch_size=None,
+    # As Walrus's training loader: one batch ahead per thread
+    loader = ThreadDataLoader(ds, num_workers=2, prefetch_factor=1, batch_size=None,
                               sampler=Batches(len(ds)), collate_fn=None)
     it = iter(loader)
     next(it)
     time.sleep(0.3)  # threads would load the whole epoch without a bound
-    # 1 consumed + 3 ahead (one submitted after the consumed batch), 3 items each
-    assert ds.fetched <= (1 + 3) * 3
+    # 1 consumed + 2 ahead, 3 items each
+    assert ds.fetched <= (1 + 2) * 3
+    # iter() returns a separate iterator: list() continues its epoch
     assert len(list(it)) == len(loader) - 1
 
 
@@ -117,3 +121,12 @@ def test_global_rng_stream_matches_dataloader():
     out = draws(ThreadDataLoader(ds, num_workers=2, batch_size=None,
                                  sampler=Batches(len(ds)), collate_fn=None))
     assert out == ref
+
+
+def test_new_epoch_after_early_exit():
+    ds = Squares()
+    loader = ThreadDataLoader(ds, num_workers=1, batch_size=1)  # 20 batches, 2 in flight
+    for i, _batch in enumerate(loader):
+        if i == 2:
+            break
+    assert sum(1 for _ in loader) == len(ds)

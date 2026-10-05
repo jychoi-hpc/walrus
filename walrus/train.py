@@ -115,7 +115,6 @@ def train(
             train_sets,
             group_color=spatial.rank if split_domain else 0,
             group_key=spatial.dp_rank if split_domain else rank,
-            max_row_mb=ddstore_cfg.get("max_row_mb", 512),
             # One registered read buffer per loader thread
             reuse_slots=int(ddstore_cfg.get("workers", 2))
             if ddstore_cfg.get("reuse_buffers", True) else 0,

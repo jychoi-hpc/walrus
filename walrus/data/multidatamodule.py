@@ -21,7 +21,6 @@ from walrus.data.inflated_dataset import (
 from walrus.utils.spatial import get_spatial_context
 
 from .mixed_dset_sampler import BatchedMultisetSampler
-from .thread_loader import ThreadDataLoader
 from .multidataset import MixedWellDataset
 from .utils import get_dict_depth
 
@@ -470,9 +469,15 @@ class MixedWellDataModule:
         shuffle = sampler is None
 
         if self.train_threads > 0:
+            # DDStore's thread-pool DataLoader (pyddstore.torch); one batch
+            # ahead per thread, each a full sample in host memory
+            from pyddstore.torch import ThreadDataLoader
+
+            logger.info(f"Training loader: {self.train_threads} threads (ThreadDataLoader)")
             return ThreadDataLoader(
                 self.train_dataset,
                 num_workers=self.train_threads,
+                prefetch_factor=1,
                 pin_memory=self.pin_memory,
                 batch_size=None,
                 shuffle=shuffle,
@@ -522,11 +527,13 @@ class MixedWellDataModule:
 
             if self.eval_in_threads and self.eval_data_workers > 0:
                 # Same workers and read-ahead as the forked loader below
+                from pyddstore.torch import ThreadDataLoader
+
                 dataloaders.append(
                     ThreadDataLoader(
                         dataset,
                         num_workers=self.eval_data_workers,
-                        prefetch=self.eval_data_workers * (self.prefetch_factor or 2),
+                        prefetch_factor=self.prefetch_factor,
                         pin_memory=self.pin_memory,
                         batch_size=None,
                         sampler=sampler,
