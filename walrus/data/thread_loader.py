@@ -5,8 +5,9 @@ threads (one at a time per store; the rest of __getitem__ overlaps).
 
 Adapted from ThreadDataLoader in DDStore's examples/vae/ddstore_dataloader.py
 (ORNL/DDStore), with two changes for Walrus's multi-GB batches:
-  - at most `prefetch` batches are fetched ahead of the consumer (the example
-    submits a whole epoch at once, keeping every finished batch in memory);
+  - at most max(num_workers, prefetch) batches are fetched ahead of the
+    consumer, by default one per thread (the example submits a whole epoch at
+    once, keeping every finished batch in memory);
   - batch_size=None (Walrus's samplers yield whole batches) calls
     dataset[index] directly, as PyTorch's own loader does.
 Collation and pinning run in the worker threads, not in the training loop.

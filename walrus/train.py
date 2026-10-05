@@ -123,7 +123,6 @@ def train(
         for dataset in train_sets:
             dataset.field_source = source
         datamodule.train_threads = int(ddstore_cfg.get("workers", 2))
-        datamodule.train_thread_prefetch = int(ddstore_cfg.get("prefetch", 2))
         # No forked loader workers once MPI and DDStore are running
         datamodule.eval_in_threads = True
     field_to_index_map = datamodule.train_dataset.field_to_index_map

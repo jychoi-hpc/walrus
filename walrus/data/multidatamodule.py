@@ -267,9 +267,8 @@ class MixedWellDataModule:
         self.eval_data_workers = data_workers if eval_data_workers is None else eval_data_workers
         # > 0: the training loader runs __getitem__ in this many threads
         # instead of forked workers (set when fields come from DDStore, whose
-        # reads cannot run in forked workers), train_thread_prefetch batches ahead
+        # reads cannot run in forked workers), one batch ahead per thread
         self.train_threads = 0
-        self.train_thread_prefetch = 0
         # True: validation/test loaders run their eval_data_workers in threads
         # too (forked workers after MPI/DDStore initialization can hang)
         self.eval_in_threads = False
@@ -474,7 +473,6 @@ class MixedWellDataModule:
             return ThreadDataLoader(
                 self.train_dataset,
                 num_workers=self.train_threads,
-                prefetch=self.train_thread_prefetch,
                 pin_memory=self.pin_memory,
                 batch_size=None,
                 shuffle=shuffle,
