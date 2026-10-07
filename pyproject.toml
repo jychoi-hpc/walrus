@@ -19,11 +19,12 @@ dependencies = [
     "numpy==1.26.4",
     "pandas==2.2",
     "plotly>=5.0,<6",
-    "the_well[benchmark] @ git+https://github.com/PolymathicAI/the_well.git@master",
+    # Unpinned so the fork checked out next to this one (installed first) satisfies it.
+    "the_well",
     "timm>=1.0,<2",
-    "torch==2.5.1",
-    "torchvision==0.20.1",
-    "torchaudio==2.5.1",
+    # Lower bound only: install torch first from the platform's index (ROCm on
+    # Frontier, CUDA on Perlmutter) and pip keeps it. torchvision/torchaudio unused.
+    "torch>=2.5",
     "torchinfo>=1.8.0,<2",
     "wandb>=0.17.9"
 ]
