@@ -158,6 +158,7 @@ class Trainer:
         big_batch_multiplier: int = 1,
         big_batch_before: int = 0,
         clip_gradient: float = 0.0,
+        skip_nonfinite_steps: bool = False,
         loss_multiplier: float = 1.0,
         minimum_context: int = 1,
         validation_full_trajectory_ensemble_size: int = 1,
@@ -245,6 +246,11 @@ class Trainer:
             Was experimented with, but not actually used.
         clip_gradient:
             The maximum gradient norm to clip to. If 0, no clipping is performed.
+        skip_nonfinite_steps:
+            Skip the optimizer step (on every rank) when the gradient norm is
+            NaN or inf, instead of writing it into the weights. Needs
+            clip_gradient > 0 (the norm comes from clipping). With bfloat16
+            the grad scaler, which would otherwise skip such steps, is off.
         loss_multiplier:
             A float to multiply the loss by before backpropagating. Useful for satisfying paranoia
             about underflow error. Generally won't matter when using Adam-family optimizers at FP32.
@@ -321,6 +327,8 @@ class Trainer:
         self.big_batch_multiplier = big_batch_multiplier
         self.big_batch_before = big_batch_before
         self.clip_gradient = clip_gradient
+        self.skip_nonfinite_steps = skip_nonfinite_steps
+        self.skipped_steps = 0
         self.loss_multiplier = loss_multiplier
         self.minimum_context = minimum_context
         self.validation_full_trajectory_ensemble_size = (
@@ -1177,18 +1185,30 @@ class Trainer:
                         avg_grad_norm += last_grad_norm.detach() / (
                             len(dataloader) / grad_acc_steps
                         )
+                grad_norm = None
                 if self.clip_gradient > 0:
                     if hasattr(self.model, "clip_grad_norm_"):
-                        self.model.clip_grad_norm_(
+                        grad_norm = self.model.clip_grad_norm_(
                             self.clip_gradient,
                             norm_type=2.0,
                         )
                     else:
-                        torch.nn.utils.clip_grad_norm_(
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.clip_gradient, norm_type=2.0
                         )
-                self.grad_scaler.step(self.optimizer)
-                self.grad_scaler.update()
+                # The norm is over the reduced gradients: the same on every
+                # rank, so every rank skips (or not) together
+                if (self.skip_nonfinite_steps and grad_norm is not None
+                        and not bool(torch.isfinite(grad_norm))):
+                    self.skipped_steps += 1
+                    logger.warning(
+                        f"Epoch {epoch}, Batch {i + 1}, Rank {self.rank}: gradient norm "
+                        f"{float(grad_norm)}, local loss {float(loss.detach())}; optimizer "
+                        f"step skipped ({self.skipped_steps} so far)"
+                    )
+                else:
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
                 self.optimizer.zero_grad()  # Set to none is now default\
                 if self.lr_scheduler_per_step and self.lr_scheduler:
                     self.lr_scheduler.step()
