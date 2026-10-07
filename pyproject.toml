@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["walrus*"]
 
+# Hydra configs, so that an installed (non-editable) walrus can run walrus.train
+[tool.setuptools.package-data]
+walrus = ["configs/**/*.yaml"]
+
 [project]
 name = "walrus"
 requires-python = ">=3.8"
