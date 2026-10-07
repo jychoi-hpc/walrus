@@ -18,5 +18,6 @@ ddstore: # Serve training fields from DDStore (nodes' host memory over libfabric
   enabled: false
   workers: 2 # threads running the training loader (ThreadDataLoader; no forked workers with DDStore), one batch ahead each; a batch is a full sample in host memory
   reuse_buffers: true # each loader thread reads into its own buffer, registered with the network once
+  gpu_direct: false # read training fields straight into GPU memory (DDStore GPUDirect RDMA, DDSTORE_FABRIC=cxi): no host copy and no host-to-GPU copy; batches are then on the GPU (pin_memory must be false)
 finetune: False
 automatic_setup: True

@@ -61,8 +61,10 @@ class _FrameSource:
     """Frames of one HDF5 file: item i is (trajectory, step) = divmod(i,
     n_steps), as a dict of this slab of every stored field."""
 
-    def __init__(self, path, keys, slab, timer):
+    def __init__(self, path, keys, slab, timer, as_torch=False):
         self.path, self.keys, self.slab, self.timer = path, keys, slab, timer
+        # torch fields: DistDataset(device=) puts only torch fields on the GPU
+        self.as_torch = as_torch
         with h5py.File(path, "r") as f:
             self.n_samples, self.n_steps = f[keys[0]].shape[:2]
         self._file = None
@@ -83,6 +85,9 @@ class _FrameSource:
                 axis, start, stop = self.slab
                 index[axis] = slice(start, stop)
             frame[key] = np.ascontiguousarray(field[(sample, step, *index)])
+            if self.as_torch:
+                import torch
+                frame[key] = torch.from_numpy(frame[key])
         self.timer["hdf5"] += time.perf_counter() - t
         return frame
 
@@ -92,17 +97,26 @@ class _FrameSource:
             self._file = None
 
 
+def init_mpi():
+    """Initialize MPI (mpi4py) for DDStore: serialized, from one thread.
+    Called before torch.distributed starts RCCL/NCCL when DDStore is on: on
+    Frontier with the RCCL network plugin, MPI_Init after RCCL's setup failed
+    to create its network endpoint ("No space left on device")."""
+    import torch  # noqa: F401  (torch must load before mpi4py initializes MPI)
+    import mpi4py
+
+    mpi4py.rc.thread_level = "serialized"
+    mpi4py.rc.threads = False
+    from mpi4py import MPI
+    return MPI
+
+
 class DDStoreFieldSource:
     """Field source for the_well's WellDataset (its `field_source` attribute)."""
 
     def __init__(self, datasets: Iterable, group_color: int, group_key: int,
-                 reuse_slots: int = 0):
-        import torch  # noqa: F401  (torch must load before mpi4py initializes MPI)
-        import mpi4py
-
-        mpi4py.rc.thread_level = "serialized"
-        mpi4py.rc.threads = False
-        from mpi4py import MPI
+                 reuse_slots: int = 0, device=None):
+        MPI = init_mpi()
         from torch.utils.data import ConcatDataset
 
         try:
@@ -116,6 +130,11 @@ class DDStoreFieldSource:
         self.comm = MPI.COMM_WORLD.Split(group_color, group_key)
         self.world_rank = MPI.COMM_WORLD.Get_rank()
         self.reuse_slots = int(reuse_slots)
+        # GPUDirect (device set): reads and read buffers on this GPU. DDStore's
+        # get_batch() synchronizes the device before reading into a GPU
+        # buffer, so a reused buffer is not overwritten while a kernel still
+        # copies out of it.
+        self.device = device
         self._row_of = row_of
         # path -> (store, concat, source index, n_steps per trajectory, keys, slab)
         self._files: Dict[str, tuple] = {}
@@ -136,12 +155,13 @@ class DDStoreFieldSource:
             keys = _stored_fields(paths[0]) if paths else []
             if not keys:
                 continue
-            sources = [_FrameSource(p, keys, slab, self.load_times) for p in paths]
+            sources = [_FrameSource(p, keys, slab, self.load_times, as_torch=device is not None)
+                       for p in paths]
             concat = ConcatDataset(sources)
             try:
                 # DistDataset raises on every rank of its group if any fails
                 store = DistDataset(concat, f"walrus{k}", comm=self.comm, method=1,
-                                    chunk_size=1)
+                                    chunk_size=1, device=device)
             except Exception as exc:  # noqa: BLE001 - raised on all ranks below
                 load_error = f"rank {self.world_rank}: {type(exc).__name__}: {exc}"
                 break
@@ -162,7 +182,8 @@ class DDStoreFieldSource:
         logger.info(
             f"DDStore: {n_frames} frames of {len(self._stores)} dataset(s) loaded in "
             f"{lt['total']:.1f} s (HDF5 reads {lt['hdf5']:.1f} s, store "
-            f"{lt['total'] - lt['hdf5']:.1f} s); group of {self.comm.Get_size()}"
+            f"{lt['total'] - lt['hdf5']:.1f} s); group of {self.comm.Get_size()}; "
+            f"reads into {self.device or 'host memory'}"
         )
 
     def _slot(self) -> Optional[int]:
@@ -203,16 +224,25 @@ class DDStoreFieldSource:
         value = store.read_rows(rows, fields=[field_key], out=out)[field_key]
         if self._timing:
             self._log_read(store, field_key, sample_idx, time_idx, len(rows),
-                           out is not None, t1 - t0, time.perf_counter() - t1)
+                           out is not None, t1 - t0, time.perf_counter() - t1,
+                           path, rows, value)
         return value
 
-    def _log_read(self, store, key, sample_idx, time_idx, n_rows, reused, prep_s, read_s):
+    def _log_read(self, store, key, sample_idx, time_idx, n_rows, reused, prep_s, read_s,
+                  path=None, rows=None, value=None):
         n = self._reads[key] = self._reads.get(key, 0) + 1
+        # Non-finite values in what was read (diagnosis: bad data vs bad model)
+        bad = ""
+        if value is not None:
+            import torch
+            v = torch.as_tensor(value)
+            bad = f", non-finite {int(v.numel() - torch.isfinite(v).sum())}"
         logger.info(
             f"DDStore read rank {self.world_rank} {threading.current_thread().name} "
-            f"{key} sample {sample_idx} t {time_idx} rows {n_rows} "
+            f"{os.path.basename(path) if path else ''} {key} sample {sample_idx} t {time_idx} "
+            f"rows {rows if rows is not None else n_rows} "
             f"{'reused' if reused else 'fresh'} buffer: buffer {prep_s:.3f} s, "
-            f"read_rows {read_s:.3f} s"
+            f"read_rows {read_s:.3f} s{bad}"
         )
         if n % 8 == 0 and hasattr(store.ddstore, "get_profile"):
             prof = store.ddstore.get_profile(f"{store.name}/{key}")

@@ -118,6 +118,9 @@ def train(
             # One registered read buffer per loader thread
             reuse_slots=int(ddstore_cfg.get("workers", 2))
             if ddstore_cfg.get("reuse_buffers", True) else 0,
+            # GPUDirect: reads land in this GPU's memory
+            device=torch.device(f"cuda:{int(local_rank)}")
+            if ddstore_cfg.get("gpu_direct", False) else None,
         )
         for dataset in train_sets:
             dataset.field_source = source
@@ -374,6 +377,11 @@ def main(cfg: DictConfig):
         cfg.distribution.distribution_type.upper() != "LOCAL" and world_size > 1
     )
 
+    # DDStore's MPI starts before torch.distributed sets up RCCL/NCCL
+    if cfg.get("ddstore", None) is not None and cfg.ddstore.get("enabled", False):
+        from walrus.data.ddstore_source import init_mpi
+
+        init_mpi()
     # Since configure_experiment uses distributed logic, distribution must be set up first
     device_mesh = configure_distribution(cfg)
     (
